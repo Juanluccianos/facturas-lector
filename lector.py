@@ -42,7 +42,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -142,14 +142,35 @@ def texto_pdf(doc):
 
 
 def _decodificar_qr(texto):
-    m = re.search(r'[?&]p=([^&\s]+)', texto or '')
+    # Algunos emisores parten el base64 en renglones: se quitan los espacios/saltos antes de buscar
+    m = re.search(r'[?&]p=([^&]+)', re.sub(r'\s+', '', texto or ''))
     if not m:
         return None
     b = urllib.parse.unquote(m.group(1)).replace('-', '+').replace('_', '/')
     b += '=' * (-len(b) % 4)
     try:
-        q = json.loads(base64.b64decode(b).decode('utf-8'))
+        raw = base64.b64decode(b).decode('utf-8', 'replace')
     except Exception:
+        return None
+    try:
+        q = json.loads(raw)
+    except Exception:
+        # JSON mal armado por el emisor, p. ej. "importe":19545715,27 (coma decimal)
+        fix = re.sub(r'("(?:importe|ctz)"\s*:\s*-?\d+),(\d+)', r'\1.\2', raw, flags=re.I)
+        try:
+            q = json.loads(fix)
+        except Exception:
+            return None
+    if not isinstance(q, dict):
+        return None
+    # Claves sin importar mayúsculas ("Cuit", "PtoVta"...) y alias usados por algunos sistemas
+    q = {k.lower(): v for k, v in q.items()}
+    if q.get('nrocmp') is None and q.get('nrocomp') is not None:
+        q['nrocmp'] = q['nrocomp']
+    q = {'fecha': q.get('fecha'), 'cuit': q.get('cuit'), 'ptoVta': q.get('ptovta'), 'tipoCmp': q.get('tipocmp'),
+         'nroCmp': q.get('nrocmp'), 'importe': q.get('importe'), 'moneda': q.get('moneda'), 'ctz': q.get('ctz'),
+         'nroDocRec': q.get('nrodocrec'), 'tipoCodAut': q.get('tipocodaut'), 'codAut': q.get('codaut')}
+    if not re.sub(r'\D', '', str(q.get('cuit') or '')):
         return None
     return {
         'fecha': fecha_iso(q.get('fecha')),
@@ -202,8 +223,8 @@ def leer_qr(doc):
 # ---------------------------------------------------------------------------
 JURIS = [('CABA', r'CABA|CAPITAL FEDERAL|CAP\.? ?FED|AGIP|C\.A\.B\.A|CIUDAD AUTONOMA'),
          ('BUENOS AIRES', r'ARBA|BUENOS AIRES|\bPBA\b|BS\.? ?AS|PCIA\.? ?BS'),
-         ('CORDOBA', r'CORDOBA'), ('SANTA FE', r'SANTA FE'), ('MENDOZA', r'MENDOZA'), ('SALTA', r'SALTA'),
-         ('TUCUMAN', r'TUCUMAN'), ('NEUQUEN', r'NEUQUEN'), ('CHACO', r'CHACO'), ('MISIONES', r'MISIONES'),
+         ('CORDOBA', r'CORDOBA|\bCBA\b|PERCCBA'), ('SANTA FE', r'SANTA FE'), ('MENDOZA', r'MENDOZA|\bMZA\b'),
+         ('SALTA', r'SALTA'), ('TUCUMAN', r'TUCUMAN|TUC\b'), ('NEUQUEN', r'NEUQUEN'), ('CHACO', r'CHACO'), ('MISIONES', r'MISIONES'),
          ('RIO NEGRO', r'RIO NEGRO'), ('CHUBUT', r'CHUBUT'), ('CORRIENTES', r'CORRIENTES'),
          ('LA PAMPA', r'LA PAMPA'), ('TIERRA DEL FUEGO', r'TIERRA DEL FUEGO')]
 
@@ -221,8 +242,8 @@ def clasif(label):
         return 'PERC_IVA'
     if re.search(r'PERC.*GANAN', L):
         return 'PERC_GAN'
-    if re.search(r'PERC|IIBB|INGRESOS BRUTOS|AGIP|ARBA|\bIB\b|\bII\.?BB', L):
-        return 'PERC_IIBB' if (re.search(r'IIBB|INGRESOS BRUTOS|AGIP|ARBA|\bIB\b|II\.?BB', L) or juris(label)) else 'PERC_GEN'
+    if re.search(r'PERC|IIBB|INGRESOS BRUTOS|AGIP|ARBA|\bIB\b|\bII\.?BB|\bPIB\b', L):
+        return 'PERC_IIBB' if (re.search(r'IIBB|INGRESOS BRUTOS|AGIP|ARBA|\bIB\b|II\.?BB|\bPIB\b', L) or juris(label)) else 'PERC_GEN'
     if re.search(r'EXENTO', L) and not re.search(r'NO GRAVADO', L):
         return 'EXENTO'
     if re.search(r'NO GRAVADO|EXENTO', L):
@@ -265,6 +286,7 @@ def candidatos(texto):
         # Pares etiqueta → importe dentro del renglón
         toks = l2.split()
         label, pend_rate, hubo_num = [], None, False
+        pend_val = None   # número chico tomado como alícuota: si no viene otro importe atrás, era el importe
         for t in toks:
             if t in ('$', 'ARS', ':', 'USD'):
                 continue
@@ -286,11 +308,15 @@ def candidatos(texto):
             if c in ('IVA', 'PERC_IIBB', 'PERC_IVA', 'PERC_GEN') and not hubo_num and pend_rate is None \
                     and (v in RATES or (c != 'IVA' and v < 10)):
                 pend_rate = v      # "I.V.A. 21.00 base monto" / "Perc IIBB CABA 0.50 1.118,08"
+                pend_val = dict(cls=c, val=v, rate=None, label=lab, clave=clave_etiqueta(lab), modo='linea')
                 continue
+            pend_val = None
             if c:
                 rate = pend_rate if c == 'IVA' and pend_rate in RATES else rate_in(lab)
                 out.append(dict(cls=c, val=v, rate=rate, label=lab, clave=clave_etiqueta(lab), modo='linea'))
             hubo_num = True
+        if pend_val and pend_val['cls'] != 'IVA':   # "PERCEP. IB Tucuman .01 % 3.12"
+            out.append(pend_val)
         prev_segs = segs
     return out
 
@@ -385,6 +411,19 @@ def resolver(cands, total, texto=None, cuadre=False):
             for S in _subsets_extras(extras, round(total - n['val'] - iv['val'], 2)):
                 sols.append(dict(gravado=[dict(alicuota=r, neto=n['val'], iva=iv['val'], c_neto=n, c_iva=iv)],
                                  extras=list(S), score=_extras_score(S) + (1 if iv['rate'] else 0)))
+    # A2) por cuadre, cuando el IVA no se puede leer del PDF (p. ej. "1.848.919," cortado):
+    #     se calcula neto × alícuota y tiene que cerrar al centavo con el total del QR
+    if cuadre and not sols:
+        for n in netos:
+            for r in RATES:
+                teorico = n['val'] * r / 100
+                for S in _subsets_extras(extras, round(total - n['val'] - teorico, 2)):
+                    iv = round(total - n['val'] - sum(x['val'] for x in S), 2)   # el IVA que cierra exacto con el QR
+                    if iv <= 0 or abs(iv - teorico) > 0.015:
+                        continue
+                    c_iva = dict(cls='IVA', val=iv, rate=r, label='', clave='', modo='calculado')
+                    sols.append(dict(gravado=[dict(alicuota=r, neto=n['val'], iva=iv, c_neto=n, c_iva=c_iva, iva_calculado=True)],
+                                     extras=list(S), score=_extras_score(S)))
     # B) varias alícuotas (solo con etiquetas, nunca por cuadre)
     if not cuadre:
         con_rate = [iv for iv in ivas if iv['rate']]
@@ -731,6 +770,8 @@ def procesar(f, ctx):
     qr, qr_via = leer_qr(doc)
     h = encabezado_texto(texto, empresas) if not qr else {}
     d = datos_base(qr, h)
+    if not d['receptor']['cuit']:   # QR sin receptor: se busca un CUIT del grupo en el texto
+        d['receptor']['cuit'] = encabezado_texto(texto, empresas).get('doc_receptor')
     cands = candidatos(texto)
     cuit = d['emisor']['cuit']
     pl = (ctx.get('plantillas') or {}).get(cuit) if cuit else None
@@ -768,6 +809,8 @@ def procesar(f, ctx):
             metodo = 'reglas'
             if sols[0]:
                 d = solucion_a_datos(sols[0], d)
+                if any(g.get('iva_calculado') for g in sols[0]['gravado']):
+                    problemas.append('El IVA no se pudo leer del PDF: se calculó (neto × alícuota) y cierra con el total del QR. Revisalo.')
             d['comprobante']['fecha_vto_pago'] = buscar_vto(texto)
         elif not os.environ.get('GEMINI_API_KEY'):
             # Sin Gemini configurado: no se traba, va a la bandeja para completarla a mano
