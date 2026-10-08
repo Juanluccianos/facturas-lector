@@ -29,6 +29,7 @@ import base64
 import io
 import itertools
 import json
+import time
 import os
 import re
 import sys
@@ -42,7 +43,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.4'
+VERSION = '1.0.5'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -669,13 +670,21 @@ def gemini_leer(pdf_bytes, cuentas):
     probar = ([model] if model else []) + [m for m in gemini_modelos(base, key) if m != model]
     errores = []
     for m in probar[:5]:
-        try:
-            data = llamar(m)
-        except urllib.error.HTTPError as e:
-            errores.append(f'{m}: HTTP {e.code}')
-            if e.code in (404, 429):
-                continue
-            raise RuntimeError(f'Gemini HTTP {e.code} ({m}): {e.read().decode("utf-8", "replace")[:300]}')
+        data = None
+        for intento in range(3):
+            try:
+                data = llamar(m)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (500, 502, 503, 504) and intento < 2:   # Gemini saturado: se espera y se reintenta
+                    time.sleep(10 * (intento + 1))
+                    continue
+                errores.append(f'{m}: HTTP {e.code}')
+                if e.code in (404, 429, 500, 502, 503, 504):        # no disponible / sin cupo / caído: el próximo modelo
+                    break
+                raise RuntimeError(f'Gemini HTTP {e.code} ({m}): {e.read().decode("utf-8", "replace")[:300]}')
+        if data is None:
+            continue
         if errores:
             print(f'  Gemini: usé {m} (antes fallaron: {", ".join(errores)}). Conviene fijar GEMINI_MODEL={m} en GitHub.')
         txt = ''.join(p.get('text', '') for p in data.get('candidates', [{}])[0].get('content', {}).get('parts', []))
