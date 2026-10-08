@@ -42,7 +42,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -768,6 +768,12 @@ def procesar(f, ctx):
             metodo = 'reglas'
             if sols[0]:
                 d = solucion_a_datos(sols[0], d)
+            d['comprobante']['fecha_vto_pago'] = buscar_vto(texto)
+        elif not os.environ.get('GEMINI_API_KEY'):
+            # Sin Gemini configurado: no se traba, va a la bandeja para completarla a mano
+            metodo = 'manual'
+            problemas.append('Las reglas generales no alcanzaron para leer esta factura y Gemini no está configurado: '
+                             'completá los datos a mano mirando el PDF y confirmá el proveedor.')
             d['comprobante']['fecha_vto_pago'] = buscar_vto(texto)
         else:
             metodo = 'ia'
