@@ -42,7 +42,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.2'
+VERSION = '1.0.3'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -657,15 +657,62 @@ def gemini_leer(pdf_bytes, cuentas):
     body = {'contents': [{'role': 'user', 'parts': [{'inline_data': {'mime_type': 'application/pdf', 'data': base64.b64encode(pdf_bytes).decode()}}, {'text': prompt}]}],
             'generationConfig': {'responseMimeType': 'application/json', 'responseSchema': ESQUEMA_GEMINI, 'temperature': 0}}
     base = os.environ.get('GEMINI_BASE', 'https://generativelanguage.googleapis.com')
-    req = urllib.request.Request(f'{base}/v1beta/models/{model}:generateContent?key={key}', data=json.dumps(body).encode(),
-                                 headers={'Content-Type': 'application/json'}, method='POST')
-    try:
+
+    def llamar(m):
+        req = urllib.request.Request(f'{base}/v1beta/models/{m}:generateContent?key={key}', data=json.dumps(body).encode(),
+                                     headers={'Content-Type': 'application/json'}, method='POST')
         with urllib.request.urlopen(req, timeout=180) as r:
-            data = json.loads(r.read().decode('utf-8'))
+            return json.loads(r.read().decode('utf-8'))
+
+    try:
+        data = llamar(model)
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f'Gemini HTTP {e.code}: {e.read().decode("utf-8", "replace")[:300]}')
+        detalle = e.read().decode('utf-8', 'replace')[:300]
+        if e.code != 404:
+            raise RuntimeError(f'Gemini HTTP {e.code}: {detalle}')
+        # El modelo configurado ya no está disponible para esta clave: se elige solo el mejor disponible
+        otro = gemini_mejor_modelo(base, key, excluir=model)
+        if not otro:
+            raise RuntimeError(f'Gemini HTTP 404 con {model} y no encontré otro modelo disponible: {detalle}')
+        print(f'  Gemini: {model} no está disponible (404), uso {otro}. Conviene fijar GEMINI_MODEL={otro} en GitHub.')
+        model = otro
+        try:
+            data = llamar(model)
+        except urllib.error.HTTPError as e2:
+            raise RuntimeError(f'Gemini HTTP {e2.code} ({model}): {e2.read().decode("utf-8", "replace")[:300]}')
     txt = ''.join(p.get('text', '') for p in data.get('candidates', [{}])[0].get('content', {}).get('parts', []))
     return json.loads(txt), model
+
+
+_MODELO_ELEGIDO = {}
+
+
+def gemini_mejor_modelo(base, key, excluir=None):
+    """Lista los modelos de la clave y elige: Pro estable más nuevo > Pro preview > Flash estable más nuevo."""
+    if 'm' in _MODELO_ELEGIDO:
+        return _MODELO_ELEGIDO['m']
+    nombres, token = [], ''
+    for _ in range(10):
+        url = f'{base}/v1beta/models?pageSize=200&key={key}' + (f'&pageToken={token}' if token else '')
+        with urllib.request.urlopen(url, timeout=60) as r:
+            j = json.loads(r.read().decode('utf-8'))
+        for m in j.get('models', []):
+            if 'generateContent' in (m.get('supportedGenerationMethods') or []):
+                nombres.append(m['name'].split('/')[-1])
+        token = j.get('nextPageToken')
+        if not token:
+            break
+
+    def puntaje(n):
+        mm = re.match(r'^gemini-(\d+(?:\.\d+)?)-(pro|flash)(.*)$', n)
+        if not mm or n == excluir or re.search(r'lite|image|tts|audio|live|thinking|computer|embedding|exp', mm.group(3)):
+            return None
+        estable = mm.group(3) in ('', '-latest')
+        return (1 if mm.group(2) == 'pro' else 0, 1 if estable else 0, float(mm.group(1)), mm.group(3) == '')
+
+    cands = sorted((p, n) for n in nombres if (p := puntaje(n)) is not None)
+    _MODELO_ELEGIDO['m'] = cands[-1][1] if cands else None
+    return _MODELO_ELEGIDO['m']
 
 
 def gemini_a_datos(g, d):
