@@ -1,1 +1,30 @@
+# Lector de facturas de proveedores — Lucciano's
+name: Lector de facturas
 
+on:
+  schedule:
+    - cron: '*/15 11-23 * * 1-5'   # UTC → 08:00 a 20:45 hora argentina, lunes a viernes
+  workflow_dispatch:
+
+concurrency:
+  group: lector-facturas
+  cancel-in-progress: false
+
+jobs:
+  leer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - name: Leer facturas pendientes
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          LECTOR_SECRET: ${{ secrets.LECTOR_SECRET }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+        run: python lector.py
