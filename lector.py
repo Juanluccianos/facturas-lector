@@ -20,7 +20,7 @@
    WORKER_URL       https://facturas-api.<subdominio>.workers.dev
    LECTOR_SECRET    mismo valor que LECTOR_SECRET en el Worker
    GEMINI_API_KEY   key de Google AI Studio (solo se usa con proveedores nuevos)
-   GEMINI_MODEL     opcional, default gemini-2.5-pro
+   GEMINI_MODEL     opcional; si no está, se elige solo el mejor Flash disponible
 =============================================================================
 """
 from __future__ import annotations
@@ -42,7 +42,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.3'
+VERSION = '1.0.4'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -648,7 +648,7 @@ def gemini_leer(pdf_bytes, cuentas):
     key = os.environ.get('GEMINI_API_KEY')
     if not key:
         raise RuntimeError('Falta GEMINI_API_KEY para leer un proveedor nuevo.')
-    model = os.environ.get('GEMINI_MODEL') or 'gemini-2.5-pro'
+    model = (os.environ.get('GEMINI_MODEL') or '').strip()
     listado = '\n'.join(f"{c['codigo_concepto']} — {c['denominacion']}" for c in cuentas[:400])
     prompt = ('Sos un analista contable argentino. Extraé los datos de este comprobante de proveedor recibido por Lucciano\'s. '
               'Importes como número con punto decimal. No inventes: si algo no figura, null. Leé una sola copia si hay original/duplicado. '
@@ -664,33 +664,56 @@ def gemini_leer(pdf_bytes, cuentas):
         with urllib.request.urlopen(req, timeout=180) as r:
             return json.loads(r.read().decode('utf-8'))
 
-    try:
-        data = llamar(model)
-    except urllib.error.HTTPError as e:
-        detalle = e.read().decode('utf-8', 'replace')[:300]
-        if e.code != 404:
-            raise RuntimeError(f'Gemini HTTP {e.code}: {detalle}')
-        # El modelo configurado ya no está disponible para esta clave: se elige solo el mejor disponible
-        otro = gemini_mejor_modelo(base, key, excluir=model)
-        if not otro:
-            raise RuntimeError(f'Gemini HTTP 404 con {model} y no encontré otro modelo disponible: {detalle}')
-        print(f'  Gemini: {model} no está disponible (404), uso {otro}. Conviene fijar GEMINI_MODEL={otro} en GitHub.')
-        model = otro
+    # Primero el modelo fijado en GEMINI_MODEL (si hay); si da 404 (no disponible) o 429 (sin cupo en el
+    # plan gratuito), se prueban los demás modelos que tiene habilitados la clave, del más conveniente al menos.
+    probar = ([model] if model else []) + [m for m in gemini_modelos(base, key) if m != model]
+    errores = []
+    for m in probar[:5]:
         try:
-            data = llamar(model)
-        except urllib.error.HTTPError as e2:
-            raise RuntimeError(f'Gemini HTTP {e2.code} ({model}): {e2.read().decode("utf-8", "replace")[:300]}')
-    txt = ''.join(p.get('text', '') for p in data.get('candidates', [{}])[0].get('content', {}).get('parts', []))
-    return json.loads(txt), model
+            data = llamar(m)
+        except urllib.error.HTTPError as e:
+            errores.append(f'{m}: HTTP {e.code}')
+            if e.code in (404, 429):
+                continue
+            raise RuntimeError(f'Gemini HTTP {e.code} ({m}): {e.read().decode("utf-8", "replace")[:300]}')
+        if errores:
+            print(f'  Gemini: usé {m} (antes fallaron: {", ".join(errores)}). Conviene fijar GEMINI_MODEL={m} en GitHub.')
+        txt = ''.join(p.get('text', '') for p in data.get('candidates', [{}])[0].get('content', {}).get('parts', []))
+        return json.loads(txt), m
+    raise RuntimeError('Ningún modelo de Gemini respondió: ' + '; '.join(errores or ['la clave no tiene modelos habilitados']))
 
 
-_MODELO_ELEGIDO = {}
+_MODELOS = []
 
 
-def gemini_mejor_modelo(base, key, excluir=None):
-    """Lista los modelos de la clave y elige: Pro estable más nuevo > Pro preview > Flash estable más nuevo."""
-    if 'm' in _MODELO_ELEGIDO:
-        return _MODELO_ELEGIDO['m']
+def gemini_modelos(base, key):
+    """Modelos de la clave, ordenados: Flash estable más nuevo, Pro estable, Flash preview, Pro preview.
+    Flash primero porque el plan gratuito de la API le da cupo; a los Pro muchas veces no."""
+    if _MODELOS:
+        return _MODELOS
+    nombres, token = [], ''
+    for _ in range(10):
+        url = f'{base}/v1beta/models?pageSize=200&key={key}' + (f'&pageToken={token}' if token else '')
+        with urllib.request.urlopen(url, timeout=60) as r:
+            j = json.loads(r.read().decode('utf-8'))
+        for m in j.get('models', []):
+            if 'generateContent' in (m.get('supportedGenerationMethods') or []):
+                nombres.append(m['name'].split('/')[-1])
+        token = j.get('nextPageToken')
+        if not token:
+            break
+
+    def puntaje(n):
+        mm = re.match(r'^gemini-(\d+(?:\.\d+)?)-(pro|flash)(-latest|-preview(?:-\d{2}-\d{4}|-\d{2}-\d{2})?)?$', n)
+        if not mm:
+            return None
+        estable = mm.group(3) in (None, '-latest')
+        es_flash = mm.group(2) == 'flash'
+        return (2 if estable else 0) + (1 if es_flash else 0), float(mm.group(1)), mm.group(3) is None
+
+    puntuados = [(puntaje(n), n) for n in nombres]
+    _MODELOS.extend(n for p, n in sorted([x for x in puntuados if x[0] is not None], reverse=True))
+    return _MODELOS
     nombres, token = [], ''
     for _ in range(10):
         url = f'{base}/v1beta/models?pageSize=200&key={key}' + (f'&pageToken={token}' if token else '')
