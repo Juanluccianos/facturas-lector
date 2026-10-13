@@ -43,7 +43,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.8'
+VERSION = '1.0.10'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -202,6 +202,53 @@ def _qr_por_redireccion(urls):
                     return q
         except Exception:
             continue
+    return None
+
+
+def _decodificar_barras(t):
+    """Código de barras ARCA (RG 1702, Interleaved 2 of 5): CUIT(11) + tipo(2/3) + PV(4/5) + CAE(14) + vto(8) + DV(1)."""
+    t = re.sub(r'\D', '', t or '')
+    if len(t) not in (40, 41, 42):
+        return None
+    b = t[:-1]
+    if (10 - (sum(int(x) for x in b[0::2]) * 3 + sum(int(x) for x in b[1::2])) % 10) % 10 != int(t[-1]):
+        return None
+    for lt, lp in ((2, 4), (3, 4), (2, 5), (3, 5)):
+        if 11 + lt + lp + 14 + 8 + 1 != len(t):
+            continue
+        cuit, tipo = t[:11], int(t[11:11 + lt])
+        pv = int(t[11 + lt:11 + lt + lp]); cae = t[11 + lt + lp:25 + lt + lp]; vto = t[25 + lt + lp:33 + lt + lp]
+        if cuit_valido(cuit) and tipo in LETRA and re.match(r'20\d{6}$', vto):
+            return {'cuit_emisor': cuit, 'tipo': tipo, 'pto_vta': pv, 'cae': cae, 'cae_vto': fecha_iso(vto)}
+    return None
+
+
+def leer_barras(doc):
+    """Respaldo cuando no hay QR: el código de barras de ARCA (sobre todo en PDFs que son una imagen)."""
+    for page in list(doc)[:2]:
+        fuentes = []
+        for im in page.get_images(full=True):
+            try:
+                pix = pymupdf.Pixmap(doc, im[0])
+                if pix.n - pix.alpha >= 4:
+                    pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
+                fuentes.append(Image.open(io.BytesIO(pix.tobytes('png'))))
+            except Exception:
+                continue
+        try:
+            fuentes.append(Image.open(io.BytesIO(page.get_pixmap(matrix=pymupdf.Matrix(2, 2)).tobytes('png'))))
+        except Exception:
+            pass
+        for img in fuentes:
+            for esc in (1, 2, 3):
+                try:
+                    i2 = img if esc == 1 else img.resize((img.width * esc, img.height * esc))
+                    for r in zxingcpp.read_barcodes(i2):
+                        b = _decodificar_barras(r.text)
+                        if b:
+                            return b
+                except Exception:
+                    continue
     return None
 
 
@@ -742,7 +789,7 @@ ESQUEMA_GEMINI = {
 }
 
 
-def gemini_leer(pdf_bytes, cuentas):
+def gemini_leer(pdf_bytes, cuentas, empresas=None):
     key = os.environ.get('GEMINI_API_KEY')
     if not key:
         raise RuntimeError('Falta GEMINI_API_KEY para leer un proveedor nuevo.')
@@ -751,6 +798,8 @@ def gemini_leer(pdf_bytes, cuentas):
     prompt = ('Sos un analista contable argentino. Extraé los datos de este comprobante de proveedor recibido por Lucciano\'s. '
               'Importes como número con punto decimal. No inventes: si algo no figura, null. Leé una sola copia si hay original/duplicado. '
               'Neto + IVA + no gravado + exento + otros tributos + percepciones debe dar el total.'
+              + (('\nEl receptor (cliente) es una de estas sociedades del grupo, buscá su CUIT en el bloque del cliente: '
+                  + ', '.join(sorted(empresas)) + '.') if empresas else '')
               + (f'\n\nPlan de cuentas para sugerir imputación:\n{listado}' if listado else ''))
     body = {'contents': [{'role': 'user', 'parts': [{'inline_data': {'mime_type': 'application/pdf', 'data': base64.b64encode(pdf_bytes).decode()}}, {'text': prompt}]}],
             'generationConfig': {'responseMimeType': 'application/json', 'responseSchema': ESQUEMA_GEMINI, 'temperature': 0}}
@@ -1040,8 +1089,17 @@ def procesar(f, ctx):
             d['comprobante']['fecha_vto_pago'] = buscar_vto(texto)
         else:
             metodo = 'ia'
-            g, modelo = gemini_leer(pdf, ctx.get('cuentas') or [])
+            g, modelo = gemini_leer(pdf, ctx.get('cuentas') or [], empresas)
             d = gemini_a_datos(g, d)
+            rc = d['receptor'].get('cuit')
+            if rc and (not cuit_valido(rc) or (empresas and rc not in empresas)):
+                # Gemini leyó mal un dígito: si hay una sola sociedad del grupo que difiere en 1-2 dígitos, es esa
+                cerca = [e for e in empresas if len(e) == len(rc) and sum(a != b for a, b in zip(e, rc)) <= 2]
+                if len(cerca) == 1:
+                    problemas.append(f'El CUIT del receptor leído ({rc}) no era válido: se tomó {cerca[0]} (sociedad del grupo). Verificalo.')
+                    d['receptor']['cuit'] = cerca[0]
+            if not d['receptor'].get('cuit'):
+                problemas.append('No se pudo leer el CUIT del receptor: completalo en la pestaña Datos (sin él ARCA no puede constatar).')
             aviso = corregir_escala_total(d) if not qr else None   # con QR el total es el del QR (ya validado contra el PDF)
             if aviso:
                 problemas.append(aviso)
@@ -1049,6 +1107,18 @@ def procesar(f, ctx):
                 problemas.append(f"La lectura de Gemini no cuadra: componentes {suma_componentes(d):.2f} vs total {d['importes']['total']:.2f}.")
             if not qr:
                 problemas.append('Sin QR legible: el encabezado (CUIT, número, CAE) lo leyó Gemini. Verificalo contra el PDF.')
+    if not qr:
+        bar = leer_barras(doc)
+        if bar:
+            c = d['comprobante']
+            dif = [k for k, a, b in (('CUIT emisor', d['emisor'].get('cuit'), bar['cuit_emisor']), ('tipo', c.get('tipo_arca'), bar['tipo']),
+                                     ('punto de venta', c.get('pto_vta'), bar['pto_vta']), ('CAE', c.get('cae'), bar['cae'])) if a and str(a) != str(b)]
+            d['emisor']['cuit'] = bar['cuit_emisor']
+            c['tipo_arca'], c['letra'], c['pto_vta'], c['cae'] = bar['tipo'], LETRA.get(bar['tipo']), bar['pto_vta'], bar['cae']
+            c['cae_vto'] = c.get('cae_vto') or bar['cae_vto']
+            qr_via = 'barras'
+            if dif:
+                problemas.append('Se corrigió con el código de barras de ARCA: ' + ', '.join(dif) + '.')
     if not d['pago']['cbu']:
         d['pago']['cbu'] = buscar_cbu(texto)
     if faltan and metodo != 'ia':
