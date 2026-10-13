@@ -43,7 +43,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.7'
+VERSION = '1.0.8'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -188,13 +188,43 @@ def _decodificar_qr(texto):
     }
 
 
+def _qr_por_redireccion(urls):
+    """Algunos sistemas (p. ej. Koobiko / quieromifactura) ponen en el QR un link propio que redirige al de ARCA."""
+    for u in urls[:2]:
+        try:
+            req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0 (lector facturas)'})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                q = _decodificar_qr(r.geturl())
+                if q:
+                    return q
+                q = _decodificar_qr(r.read(300000).decode('utf-8', 'replace').replace('&amp;', '&'))
+                if q:
+                    return q
+        except Exception:
+            continue
+    return None
+
+
 def leer_qr(doc):
+    q, via, externos = _leer_qr(doc)
+    if q:
+        return q, via
+    q = _qr_por_redireccion(externos)
+    return (q, 'link_emisor') if q else (None, None)
+
+
+def _leer_qr(doc):
+    externos = []
+    def _ext(t):
+        t = (t or '').strip()
+        if re.match(r'^https?://', t, re.I) and 'tcpdf.org' not in t.lower() and t not in externos:
+            externos.append(t)
     # 1) links embebidos
     for page in doc:
         for l in page.get_links():
             q = _decodificar_qr(l.get('uri', ''))
             if q:
-                return q, 'link'
+                return q, 'link', externos
     # 2) imágenes embebidas
     for page in doc:
         for im in page.get_images(full=True):
@@ -205,7 +235,8 @@ def leer_qr(doc):
                 for r in zxingcpp.read_barcodes(Image.open(io.BytesIO(pix.tobytes('png')))):
                     q = _decodificar_qr(r.text)
                     if q:
-                        return q, 'imagen'
+                        return q, 'imagen', externos
+                    _ext(r.text)
             except Exception:
                 continue
     # 3) página renderizada (QR dibujado con vectores)
@@ -215,8 +246,9 @@ def leer_qr(doc):
             for r in zxingcpp.read_barcodes(img):
                 q = _decodificar_qr(r.text)
                 if q:
-                    return q, 'render'
-    return None, None
+                    return q, 'render', externos
+                _ext(r.text)
+    return None, None, externos
 
 
 def corregir_escala_qr(qr, texto):
@@ -315,13 +347,13 @@ def candidatos(texto):
         l2 = re.sub(r'\$', ' $ ', l)
         l2 = re.sub(r':(?=\S)', ': ', l2)
         segs = [s.strip() for s in re.split(r'\s{2,}', l2.strip()) if s.strip() and s.strip() != '$']
-        vals = [money(s) for s in segs]
+        vals = [0.0 if re.match(r'^-?0+(?:[.,]0+)?$|^-$', s) else money(s) for s in segs]   # celdas "0" o "-" = cero
         # Fila de valores debajo de una fila de encabezados con la misma cantidad de columnas
         if prev_segs and len(vals) >= 3 and all(v is not None for v in vals) and len(prev_segs) == len(vals) \
                 and all(money(s) is None for s in prev_segs):
             for h, v in zip(prev_segs, vals):
                 c = clasif(h)
-                if c:
+                if c and v:
                     out.append(dict(cls=c, val=v, rate=rate_in(h), label=h, clave=clave_etiqueta(h), modo='columna'))
         # Pares etiqueta → importe dentro del renglón
         toks = l2.split()
