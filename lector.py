@@ -43,7 +43,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.6'
+VERSION = '1.0.7'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -286,11 +286,15 @@ def clasif(label):
         return 'NOGRAV'
     if re.search(r'OTROS TRIBUTOS|IMP\.? INT|IMPUESTOS? INTERNOS', L):
         return 'OTROS'
+    if re.search(r'^LEY\b|\bLEY (PROV|\d)', L):   # tributos de servicios públicos: "LEY 11769 ART 75", "LEY PROV. 7290"
+        return 'OTROS'
     if re.search(r'\bI\.?V\.?A\.?\b|IVA INSC', L):
         return 'IVA'
     if re.search(r'NETO|SUBTOTAL|SUB TOTAL|GRAVADO|BASE (IMPONIBLE|GRAV)', L):
         return 'NETO'
     if re.search(r'\bTOTAL\b', L):
+        if re.search(r'\b2\s*[°º]?\s*\.?\s*DO\b|SEGUNDO|RECARGO|ANTERIOR', L):   # "Total al 2do. vencimiento" (con recargo)
+            return None
         return 'TOTAL'
     return None
 
@@ -341,7 +345,7 @@ def candidatos(texto):
                 continue
             lab = ' '.join(label)
             c = clasif(lab)
-            if c in ('IVA', 'PERC_IIBB', 'PERC_IVA', 'PERC_GEN') and not hubo_num and pend_rate is None \
+            if c in ('IVA', 'PERC_IIBB', 'PERC_IVA', 'PERC_GEN', 'OTROS') and not hubo_num and pend_rate is None \
                     and (v in RATES or (c != 'IVA' and v < 10)):
                 pend_rate = v      # "I.V.A. 21.00 base monto" / "Perc IIBB CABA 0.50 1.118,08"
                 pend_val = dict(cls=c, val=v, rate=None, label=lab, clave=clave_etiqueta(lab), modo='linea')
@@ -361,7 +365,7 @@ def fechas_etiquetadas(texto):
     """Pares etiqueta → fecha (para aprender dónde está el vencimiento de pago)."""
     out, prev = [], ''
     for l in texto.splitlines():
-        cerca_cae = bool(re.search(r'C\.?\s?A\.?\s?E\b', l + ' ' + prev, re.I))
+        cerca_cae = bool(re.search(r'C\.?\s?A\.?\s?E\b|C\.?\s?E\.?\s?S\.?\s?P\b', l + ' ' + prev, re.I))
         if l.strip():
             prev = l
         for m in re.finditer(r'([A-Za-zÁÉÍÓÚáéíóúñÑ.°º ]{3,60}?)[:\s]+(\d{1,2}\s*[/.\-]\s*\d{1,2}\s*[/.\-]\s*\d{2,4}|20\d{2}-\d{2}-\d{2}|20\d{6})', l):
@@ -378,7 +382,8 @@ def buscar_vto(texto, clave=None):
             if x['clave'] == clave:
                 return x['fecha']
     for x in fe:
-        if re.search(r'VTO|VENC', x['clave']) and not re.search(r'C\.?A\.?E', x['clave']) and not x.get('cerca_cae'):
+        if re.search(r'VTO|VENC', x['clave']) and not re.search(r'C\.?A\.?E|C\.?E\.?S\.?P|PROXIM|\bDO\b|SEGUNDO|RECARGO', x['clave']) \
+                and not x.get('cerca_cae'):
             return x['fecha']
     return None
 
@@ -428,6 +433,13 @@ def _subsets_extras(extras, resto):
     return out
 
 
+def _subsets_extras_libre(extras):
+    for k in range(0, min(6, len(extras)) + 1):
+        for S in itertools.combinations(extras, k):
+            if len({x['val'] for x in S}) == len(S):
+                yield S
+
+
 def resolver(cands, total, texto=None, cuadre=False):
     netos = _dedup([c for c in cands if c['cls'] == 'NETO' and c['val'] > 0])
     ivas = _dedup([c for c in cands if c['cls'] == 'IVA' and c['val'] > 0])
@@ -459,6 +471,17 @@ def resolver(cands, total, texto=None, cuadre=False):
                         continue
                     c_iva = dict(cls='IVA', val=iv, rate=r, label='', clave='', modo='calculado')
                     sols.append(dict(gravado=[dict(alicuota=r, neto=n['val'], iva=iv, c_neto=n, c_iva=c_iva, iva_calculado=True)],
+                                     extras=list(S), score=_extras_score(S)))
+    # A3) neto por diferencia: el neto no figura como un solo importe (luz: "Subtotal costo energía" + cargos aparte)
+    #     pero el IVA trae su alícuota impresa. neto = total − IVA − extras y tiene que dar el IVA al centavo.
+    if not cuadre and not sols:
+        for iv in ivas:
+            if not iv['rate']:
+                continue
+            for S in _subsets_extras_libre(extras):
+                n = round(total - iv['val'] - sum(x['val'] for x in S), 2)
+                if n > 0 and abs(n * iv['rate'] / 100 - iv['val']) <= 0.02:
+                    sols.append(dict(gravado=[dict(alicuota=iv['rate'], neto=n, iva=iv['val'], c_neto=None, c_iva=iv, neto_calculado=True)],
                                      extras=list(S), score=_extras_score(S)))
     # B) varias alícuotas (solo con etiquetas, nunca por cuadre)
     if not cuadre:
@@ -611,9 +634,6 @@ def aplicar_plantilla(pl, cands, texto, d):
     grav = [g for g in grav if (g['neto'] or 0) > 0 or g['iva'] > 0]
     if problemas:
         return d, problemas
-    for g in grav:
-        if abs(g['neto'] * g['alicuota'] / 100 - g['iva']) > _tol_iva(g['neto']):
-            problemas.append(f"El IVA {g['alicuota']}% ({g['iva']:.2f}) no corresponde al neto {g['neto']:.2f}.")
     extras, claves_usadas = [], set()
     for e in pl.get('extras', []):
         v = _buscar(cands, e.get('clave'), EXTRA_CLS)
@@ -621,6 +641,16 @@ def aplicar_plantilla(pl, cands, texto, d):
             extras.append(dict(cls=e['cls'], val=v[0], label=e.get('etiqueta') or e.get('clave'), clave=e.get('clave'),
                                jurisdiccion=e.get('jurisdiccion')))
             claves_usadas.add(e.get('clave'))
+    if len(grav) == 1 and abs(grav[0]['neto'] * grav[0]['alicuota'] / 100 - grav[0]['iva']) > _tol_iva(grav[0]['neto']):
+        # El neto impreso no es toda la base (luz: cargos que se suman aparte). Si total − IVA − extras da
+        # exactamente el IVA con la alícuota impresa, ese es el neto.
+        g = grav[0]
+        n2 = round(total - g['iva'] - sum(x['val'] for x in extras), 2)
+        if n2 > 0 and abs(n2 * g['alicuota'] / 100 - g['iva']) <= 0.02:
+            g['neto'] = n2
+    for g in grav:
+        if abs(g['neto'] * g['alicuota'] / 100 - g['iva']) > _tol_iva(g['neto']):
+            problemas.append(f"El IVA {g['alicuota']}% ({g['iva']:.2f}) no corresponde al neto {g['neto']:.2f}.")
     suma = round(sum(g['neto'] + g['iva'] for g in grav) + sum(x['val'] for x in extras), 2)
     if abs(suma - total) > TOL:
         # ¿Apareció un concepto nuevo (percepción, no gravado) que no estaba en la configuración?
@@ -828,8 +858,28 @@ def suma_componentes(d):
 # ---------------------------------------------------------------------------
 #  Encabezado sin QR (respaldo por texto)
 # ---------------------------------------------------------------------------
-LETRA = {1: 'A', 2: 'A', 3: 'A', 6: 'B', 7: 'B', 8: 'B', 11: 'C', 12: 'C', 13: 'C', 51: 'M', 52: 'M', 53: 'M',
+LETRA = {1: 'A', 2: 'A', 3: 'A', 6: 'B', 7: 'B', 8: 'B', 11: 'C', 12: 'C', 13: 'C', 51: 'M', 52: 'M', 53: 'M', 17: 'A', 18: 'B',
          201: 'A', 202: 'A', 203: 'A', 206: 'B', 207: 'B', 208: 'B', 211: 'C', 212: 'C', 213: 'C'}
+
+
+# Emisores que NO imprimen su CUIT en el PDF: se reconocen por la razón social (Edenor, p. ej.)
+EMISORES_SIN_CUIT = [('30656516514', r'EDENOR|EMPRESA DISTRIBUIDORA Y COMERCIALIZADORA NORTE')]
+
+# Liquidación de Servicios Públicos (luz, gas, agua): tipo ARCA 17 (A) / 18 (B), autorizada con C.E.S.P.
+RX_LSP = r'LIQUIDACI[OÓ]N DE SERVICIOS? P[UÚ]BLICOS?'
+
+
+def emisor_por_texto(texto, plantillas=None):
+    T = norm(texto)
+    for cuit, rx in EMISORES_SIN_CUIT:
+        if re.search(rx, T):
+            return cuit
+    # Proveedor ya confirmado cuya razón social aparece en el PDF (al menos 2 palabras significativas)
+    for cuit, pl in (plantillas or {}).items():
+        rs = re.sub(r'\b(S\.?A\.?|S\.?R\.?L\.?|SAS|SOCIEDAD ANONIMA)\b', '', norm(pl.get('razon_social') or '')).strip(' .,')
+        if len(rs) >= 8 and len(rs.split()) >= 2 and rs in T:
+            return cuit
+    return None
 
 
 def encabezado_texto(texto, empresas):
@@ -843,13 +893,31 @@ def encabezado_texto(texto, empresas):
     h['doc_receptor'] = next((c for c in cuits if c in empresas), None)
     m = re.search(r'C\.?\s?A\.?\s?E\.?\s*(?:N[°º.o]*)?\s*:?\s*(\d{14})', texto, re.I)
     h['cae'] = m.group(1) if m else None
-    m = re.search(r'(?<!\d)(\d{4,5})\s*-\s*(\d{8})(?!\d)', texto)
+    if not h['cae']:
+        m = re.search(r'C\.?\s?E\.?\s?S\.?\s?P\.?\s*(?:N[°º.o]*)?\s*:?\s*(\d{14})', texto, re.I)
+        if m:
+            h['cae'], h['tipo_autorizacion'] = m.group(1), 'CESP'
+    # Liquidación de servicios públicos: la letra va antes o después ("B Liquidación…" / "…Públicos A 0099-0078286335")
+    T = texto.upper()
+    m = re.search(r'(?<![A-Z.])([AB])\s+' + RX_LSP, T) or re.search(RX_LSP + r'\s+([AB])\b', T)
+    lsp = bool(m)
     if m:
+        h['tipo'] = 17 if m.group(1) == 'A' else 18
+    # Número: primero el que está junto a "Liquidación de servicios públicos" (las facturas de luz traen otros números sueltos)
+    m = (re.search(RX_LSP + r'[^\n]{0,25}?(?<!\d)(\d{4,5})\s*-\s*(\d{8,10})(?!\d)', T) if lsp else None) \
+        or re.search(r'(?<!\d)(\d{4,5})\s*-\s*(\d{8})(?!\d)', texto) \
+        or re.search(r'(?<!\d)(\d{4,5})\s*-\s*(0{1,2}\d{8})(?!\d)', texto)
+    if m and int(m.group(2)) < 10 ** 8:
         h['pto_vta'], h['numero'] = int(m.group(1)), int(m.group(2))
-    m = re.search(r'C[OÓ]D(?:IGO)?\.?\s*N?[°º]?\s*:?\s*0*(\d{1,3})\b', texto, re.I)
-    h['tipo'] = int(m.group(1)) if m and int(m.group(1)) in LETRA else None
-    m = re.search(r'Fecha(?:\s+de)?(?:\s+Emisi[oó]n)?\s*:?\s*(\d{1,2}\s*[/.\-]\s*\d{1,2}\s*[/.\-]\s*\d{2,4})', texto, re.I)
+    if not lsp:
+        m = re.search(r'C[OÓ]D(?:IGO)?\.?\s*N?[°º]?\s*:?\s*0*(\d{1,3})\b', texto, re.I)
+        h['tipo'] = int(m.group(1)) if m and int(m.group(1)) in LETRA else None
+    m = re.search(r'Fecha(?:\s+de)?(?:\s+Emisi[oó]n)?\s*:?\s*(\d{1,2}\s*[/.\-]\s*\d{1,2}\s*[/.\-]\s*\d{2,4})', texto, re.I) \
+        or re.search(r'Emisi[oó]n\s*:?\s*(\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{4})', texto, re.I)
     h['fecha'] = fecha_iso(m.group(1)) if m else None
+    if not h['fecha']:   # "FECHA DE EMISION" con la fecha en otra columna o renglón
+        m = re.search(r'FECHA\s+DE\s+EMISI[OÓ]N[\s\S]{0,250}?(\d{2}/\d{2}/\d{4})', texto, re.I)
+        h['fecha'] = fecha_iso(m.group(1)) if m else None
     tot = [c['val'] for c in candidatos(texto) if c['cls'] == 'TOTAL']
     h['total'] = max(tot) if tot else None
     return h
@@ -867,7 +935,7 @@ def datos_base(qr, h):
         'receptor': {'cuit': src.get('doc_receptor') or None, 'razon_social': None},
         'comprobante': {'tipo_arca': tipo, 'letra': LETRA.get(tipo), 'pto_vta': src.get('pto_vta'), 'numero': src.get('numero'),
                         'fecha_emision': src.get('fecha'), 'fecha_vto_pago': None, 'moneda': (qr or {}).get('moneda', 'PES'),
-                        'cotizacion': (qr or {}).get('cotizacion'), 'tipo_autorizacion': (qr or {}).get('tipo_autorizacion', 'CAE'),
+                        'cotizacion': (qr or {}).get('cotizacion'), 'tipo_autorizacion': src.get('tipo_autorizacion') or 'CAE',
                         'cae': src.get('cae'), 'cae_vto': None, 'orden_compra': None},
         'importes': {'gravado': [], 'sin_discriminar': 0.0, 'no_gravado': 0.0, 'exento': 0.0, 'otros_tributos': 0.0,
                      'total': round(float(src.get('total') or 0), 2)},
@@ -887,6 +955,8 @@ def procesar(f, ctx):
     d = datos_base(qr, h)
     if not d['receptor']['cuit']:   # QR sin receptor: se busca un CUIT del grupo en el texto
         d['receptor']['cuit'] = encabezado_texto(texto, empresas).get('doc_receptor')
+    if not d['emisor']['cuit']:   # el PDF no trae el CUIT del emisor (Edenor) o vino en otro formato
+        d['emisor']['cuit'] = emisor_por_texto(texto, ctx.get('plantillas'))
     cands = candidatos(texto)
     cuit = d['emisor']['cuit']
     pl = (ctx.get('plantillas') or {}).get(cuit) if cuit else None
@@ -924,6 +994,9 @@ def procesar(f, ctx):
             metodo = 'reglas'
             if sols[0]:
                 d = solucion_a_datos(sols[0], d)
+                if any(g.get('neto_calculado') for g in sols[0]['gravado']):
+                    problemas.append('El neto no figura como un solo importe en el PDF: se calculó como total − IVA − otros conceptos '
+                                     'y cierra al centavo con la alícuota impresa. Revisalo.')
                 if any(g.get('iva_calculado') for g in sols[0]['gravado']):
                     problemas.append('El IVA no se pudo leer del PDF: se calculó (neto × alícuota) y cierra con el total del QR. Revisalo.')
             d['comprobante']['fecha_vto_pago'] = buscar_vto(texto)
