@@ -43,7 +43,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.5'
+VERSION = '1.0.6'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -217,6 +217,41 @@ def leer_qr(doc):
                 if q:
                     return q, 'render'
     return None, None
+
+
+def corregir_escala_qr(qr, texto):
+    """Algunos emisores arman el QR con el importe sin la coma decimal (ej. 680008366 en vez de 6800083.66).
+    Si el total del QR no aparece en el PDF pero sí aparece dividido por 100 o por 1000, se corrige."""
+    if not qr or not qr.get('total'):
+        return None
+    montos = set()
+    for tok in re.split(r'[\s$]+', texto or ''):
+        v = money(tok.strip(':;'))
+        if v:
+            montos.add(round(v, 2))
+    if round(qr['total'], 2) in montos:
+        return None
+    for f in (100, 1000):
+        cand = round(qr['total'] / f, 2)
+        if cand in montos:
+            orig = qr['total']
+            qr['total'] = cand
+            ar = lambda v: f'{v:,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+            return (f'El QR del emisor trae el importe mal armado ({orig:.0f}, sin la coma decimal): '
+                    f'se tomó $ {ar(cand)}, que es el total impreso en la factura. Verificalo.')
+    return None
+
+
+def corregir_escala_total(d):
+    """Si el total es exactamente 100 o 1000 veces la suma de los componentes, el error está en la coma del total."""
+    s, t = suma_componentes(d), d['importes']['total']
+    if not s or not t or abs(s - t) <= TOL:
+        return None
+    for f in (100, 1000):
+        if abs(t / f - s) <= TOL:
+            d['importes']['total'] = s
+            return f'El total leído ({t:.2f}) era {f} veces la suma de los componentes: se corrigió a {s:.2f}. Verificalo contra el PDF.'
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +882,7 @@ def procesar(f, ctx):
     texto = texto_pdf(doc)
     empresas = set(ctx.get('empresas') or [])
     qr, qr_via = leer_qr(doc)
+    aviso_qr = corregir_escala_qr(qr, texto)
     h = encabezado_texto(texto, empresas) if not qr else {}
     d = datos_base(qr, h)
     if not d['receptor']['cuit']:   # QR sin receptor: se busca un CUIT del grupo en el texto
@@ -854,7 +890,7 @@ def procesar(f, ctx):
     cands = candidatos(texto)
     cuit = d['emisor']['cuit']
     pl = (ctx.get('plantillas') or {}).get(cuit) if cuit else None
-    problemas, metodo, modelo = [], None, None
+    problemas, metodo, modelo = ([aviso_qr] if aviso_qr else []), None, None
     sin_texto = len(texto.strip()) < 40
 
     faltan = [k for k, v in (('CUIT emisor', cuit), ('tipo', d['comprobante']['tipo_arca']), ('número', d['comprobante']['numero']),
@@ -901,6 +937,9 @@ def procesar(f, ctx):
             metodo = 'ia'
             g, modelo = gemini_leer(pdf, ctx.get('cuentas') or [])
             d = gemini_a_datos(g, d)
+            aviso = corregir_escala_total(d) if not qr else None   # con QR el total es el del QR (ya validado contra el PDF)
+            if aviso:
+                problemas.append(aviso)
             if abs(suma_componentes(d) - d['importes']['total']) > TOL:
                 problemas.append(f"La lectura de Gemini no cuadra: componentes {suma_componentes(d):.2f} vs total {d['importes']['total']:.2f}.")
             if not qr:
