@@ -43,7 +43,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.13'
+VERSION = '1.0.14'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -80,10 +80,13 @@ def clave_etiqueta(label):
 
 
 MONEY = re.compile(r'^-?\d{1,3}(?:[.,]\d{3})+[.,]\d{2}$|^-?\d+[.,]\d{2}$')
+MONEY1 = re.compile(r'^-?\d{1,3}(?:,\d{3})+\.\d$')
 
 
 def money(tok):
     t = str(tok).replace('ARS', '').replace('USD', '').strip().lstrip('$').strip()
+    if MONEY1.match(t):   # "10,493,500.0" (miles con coma y un solo decimal)
+        return round(float(t.replace(',', '')), 2)
     if not MONEY.match(t):
         return None
     ent = t[:-3].replace('.', '').replace(',', '')
@@ -159,6 +162,23 @@ def _dig(v):
     return re.sub(r'\D', '', t)
 
 
+def _json_tolerante(raw):
+    """QR con JSON inválido (Datcom: "fecha":0026-10-06 sin comillas, "ptoVta":00003 con ceros adelante).
+    Se leen los pares "clave":valor uno por uno."""
+    q = {}
+    for m in re.finditer(r'"(\w+)"\s*:\s*("((?:[^"\\]|\\.)*)"|[^,}\s]+)', raw):
+        k, v = m.group(1), (m.group(3) if m.group(3) is not None else m.group(2))
+        if m.group(3) is None:
+            if re.match(r'^-?\d+$', v):
+                v = int(v)
+            elif re.match(r'^-?\d+\.\d+$', v):
+                v = float(v)
+            elif re.match(r'^\d{4}-\d{2}-\d{2}$', v) and v.startswith('00'):
+                v = '20' + v[2:]   # "0026-10-06" → 2026-10-06
+        q[k] = v
+    return q if q.get('cuit') else None
+
+
 def _decodificar_qr(texto):
     # Algunos emisores parten el base64 en renglones: se quitan los espacios/saltos antes de buscar
     m = re.search(r'[?&]p=([^&]+)', re.sub(r'\s+', '', texto or ''))
@@ -178,7 +198,9 @@ def _decodificar_qr(texto):
         try:
             q = json.loads(fix)
         except Exception:
-            return None
+            q = _json_tolerante(fix)
+            if not q:
+                return None
     if not isinstance(q, dict):
         return None
     # Claves sin importar mayúsculas ("Cuit", "PtoVta"...) y alias usados por algunos sistemas
