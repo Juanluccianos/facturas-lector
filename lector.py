@@ -43,7 +43,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.11'
+VERSION = '1.0.12'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -142,6 +142,23 @@ def texto_pdf(doc):
     return '\n'.join(lineas)
 
 
+def _dig(v):
+    """Dígitos de un campo del QR. Algunos sistemas mandan números como float (3.0713263008e10):
+    str() daría '30713263008.0' y quedaría un 0 de más."""
+    if isinstance(v, bool) or v is None:
+        return ''
+    if isinstance(v, float):
+        return str(int(round(v)))
+    if isinstance(v, int):
+        return str(v)
+    t = str(v).strip()
+    if re.match(r'^\d+\.0+$', t):
+        t = t.split('.')[0]
+    elif re.match(r'^\d+(\.\d+)?[eE]\+?\d+$', t):
+        t = str(int(round(float(t))))
+    return re.sub(r'\D', '', t)
+
+
 def _decodificar_qr(texto):
     # Algunos emisores parten el base64 en renglones: se quitan los espacios/saltos antes de buscar
     m = re.search(r'[?&]p=([^&]+)', re.sub(r'\s+', '', texto or ''))
@@ -171,20 +188,20 @@ def _decodificar_qr(texto):
     q = {'fecha': q.get('fecha'), 'cuit': q.get('cuit'), 'ptoVta': q.get('ptovta'), 'tipoCmp': q.get('tipocmp'),
          'nroCmp': q.get('nrocmp'), 'importe': q.get('importe'), 'moneda': q.get('moneda'), 'ctz': q.get('ctz'),
          'nroDocRec': q.get('nrodocrec'), 'tipoCodAut': q.get('tipocodaut'), 'codAut': q.get('codaut')}
-    if not re.sub(r'\D', '', str(q.get('cuit') or '')):
+    if not _dig(q.get('cuit')):
         return None
     return {
         'fecha': fecha_iso(q.get('fecha')),
-        'cuit_emisor': re.sub(r'\D', '', str(q.get('cuit', ''))),
+        'cuit_emisor': _dig(q.get('cuit')),
         'pto_vta': int(q['ptoVta']) if q.get('ptoVta') is not None else None,
         'tipo': int(q['tipoCmp']) if q.get('tipoCmp') is not None else None,
         'numero': int(q['nroCmp']) if q.get('nroCmp') is not None else None,
         'total': round(float(q.get('importe', 0)), 2),
         'moneda': q.get('moneda') or 'PES',
         'cotizacion': float(q.get('ctz') or 1),
-        'doc_receptor': re.sub(r'\D', '', str(q.get('nroDocRec', ''))),
+        'doc_receptor': _dig(q.get('nroDocRec')),
         'tipo_autorizacion': 'CAEA' if q.get('tipoCodAut') == 'A' else 'CAE',
-        'cae': re.sub(r'\D', '', str(q.get('codAut', ''))),
+        'cae': _dig(q.get('codAut')),
     }
 
 
@@ -952,6 +969,25 @@ def gemini_a_datos(g, d):
     return d
 
 
+def reclasificar_percepcion_iva(d, texto):
+    """Algunos emisores ponen la percepción de IVA (RG 5329/3337/2408) en el renglón "Importe otros tributos".
+    Si el mismo importe aparece en un renglón de percepción de IVA, va como percepción (es crédito fiscal, no costo)."""
+    ot = round(d['importes'].get('otros_tributos') or 0, 2)
+    if ot <= 0:
+        return None
+    lineas = [l for l in texto.splitlines() if l.strip()]
+    for i, l in enumerate(lineas):
+        ctx = norm(l + ' ' + (lineas[i - 1] if i else ''))
+        if not (re.search(r'PERC', ctx) and re.search(r'\bI\.?V\.?A\b|5329|3337|2408', ctx)):
+            continue
+        vals = [money(t) for t in re.sub(r'\$', ' ', l).split()]
+        if any(v is not None and abs(v - ot) < 0.01 for v in vals):
+            d['importes']['otros_tributos'] = 0.0
+            d['percepciones'].append(dict(tipo='IVA', jurisdiccion=None, importe=ot, descripcion='Percepción de IVA (figuraba como otros tributos)'))
+            return f'La percepción de IVA ({ot:.2f}) figuraba como “otros tributos”: se cargó como percepción de IVA.'
+    return None
+
+
 def suma_componentes(d):
     im = d['importes']
     s = sum(g['neto'] + g['iva'] for g in im['gravado']) + im['sin_discriminar'] + im['no_gravado'] + im['exento'] + im['otros_tributos']
@@ -1145,6 +1181,9 @@ def procesar(f, ctx):
             qr_via = 'barras'
             if dif:
                 problemas.append('Se corrigió con el código de barras de ARCA: ' + ', '.join(dif) + '.')
+    aviso_perc = reclasificar_percepcion_iva(d, texto)
+    if aviso_perc:
+        problemas.append(aviso_perc)
     if not d['pago']['cbu']:
         d['pago']['cbu'] = buscar_cbu(texto)
     if faltan and metodo != 'ia':
