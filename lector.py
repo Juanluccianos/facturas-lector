@@ -43,7 +43,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.10'
+VERSION = '1.0.11'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -298,6 +298,20 @@ def _leer_qr(doc):
     return None, None, externos
 
 
+def corregir_tipo_qr(qr, texto):
+    """Algunos sistemas (Nestlé) ponen en el QR tipo 81 (Tique Factura A) en una Factura A con CAE.
+    Los tiques de controlador fiscal no tienen CAE: si hay CAE y el PDF dice "Cód. 01", vale lo impreso."""
+    if not qr or qr.get('tipo') not in (81, 82, 83) or not qr.get('cae'):
+        return None
+    for m in re.finditer(r'C[OÓ]D(?:IGO)?\.?\s*N?[°º]?\s*:?\s*0*(\d{1,3})\b', texto, re.I):
+        t = int(m.group(1))
+        if t in LETRA and t not in (81, 82, 83):
+            ant = qr['tipo']
+            qr['tipo'] = t
+            return f'El QR del emisor dice tipo {ant} (tique) pero el comprobante tiene CAE e impreso “Cód. {t:02d}”: se tomó tipo {t}.'
+    return None
+
+
 def corregir_escala_qr(qr, texto):
     """Algunos emisores arman el QR con el importe sin la coma decimal (ej. 680008366 en vez de 6800083.66).
     Si el total del QR no aparece en el PDF pero sí aparece dividido por 100 o por 1000, se corrige."""
@@ -336,12 +350,20 @@ def corregir_escala_total(d):
 # ---------------------------------------------------------------------------
 #  Pares etiqueta → importe
 # ---------------------------------------------------------------------------
-JURIS = [('CABA', r'CABA|CAPITAL FEDERAL|CAP\.? ?FED|AGIP|C\.A\.B\.A|CIUDAD AUTONOMA'),
-         ('BUENOS AIRES', r'ARBA|BUENOS AIRES|\bPBA\b|BS\.? ?AS|PCIA\.? ?BS'),
-         ('CORDOBA', r'CORDOBA|\bCBA\b|PERCCBA'), ('SANTA FE', r'SANTA FE'), ('MENDOZA', r'MENDOZA|\bMZA\b'),
-         ('SALTA', r'SALTA'), ('TUCUMAN', r'TUCUMAN|TUC\b'), ('NEUQUEN', r'NEUQUEN'), ('CHACO', r'CHACO'), ('MISIONES', r'MISIONES'),
-         ('RIO NEGRO', r'RIO NEGRO'), ('CHUBUT', r'CHUBUT'), ('CORRIENTES', r'CORRIENTES'),
-         ('LA PAMPA', r'LA PAMPA'), ('TIERRA DEL FUEGO', r'TIERRA DEL FUEGO')]
+# Jurisdicciones: nombre, siglas y código de Convenio Multilateral (901 CABA … 924 Tucumán, p. ej. "913-MZA", "915-NEU")
+JURIS = [('CABA', r'CABA|CAPITAL FEDERAL|CAP\.? ?FED|AGIP|C\.A\.B\.A|CIUDAD AUTONOMA|\b901\b'),
+         ('BUENOS AIRES', r'ARBA|BUENOS AIRES|\bPBA\b|BS\.? ?AS|PCIA\.? ?BS|\b902\b'),
+         ('CATAMARCA', r'CATAMARCA|\bCAT\b|\b903\b'),
+         ('CORDOBA', r'CORDOBA|\bCBA\b|\bCOR\b|PERCCBA|\b904\b'), ('CORRIENTES', r'CORRIENTES|\bCTES\b|\b905\b'),
+         ('CHACO', r'CHACO|\bCHA\b|\b906\b'), ('CHUBUT', r'CHUBUT|\bCHU\b|\b907\b'),
+         ('ENTRE RIOS', r'ENTRE RIOS|\bE\.? ?RIOS\b|\bER\b|\b908\b'), ('FORMOSA', r'FORMOSA|\bFSA\b|\b909\b'),
+         ('JUJUY', r'JUJUY|\bJUJ\b|\b910\b'), ('LA PAMPA', r'LA PAMPA|\bLPA\b|\b911\b'), ('LA RIOJA', r'LA RIOJA|\bLRJ\b|\b912\b'),
+         ('MENDOZA', r'MENDOZA|\bMZA\b|\bMEN\b|\b913\b'), ('MISIONES', r'MISIONES|\bMIS\b|\b914\b'),
+         ('NEUQUEN', r'NEUQUEN|\bNEU\b|\bNQN\b|\b915\b'), ('RIO NEGRO', r'RIO NEGRO|\bRNE?\b|\b916\b'),
+         ('SALTA', r'SALTA|\bSAL\b|\b917\b'), ('SAN JUAN', r'SAN JUAN|\bSJU?\b|\b918\b'), ('SAN LUIS', r'SAN LUIS|\bSLU?\b|\b919\b'),
+         ('SANTA CRUZ', r'SANTA CRUZ|\bSCR?\b|\b920\b'), ('SANTA FE', r'SANTA FE|\bSFE?\b|\b921\b'),
+         ('SANTIAGO DEL ESTERO', r'SANTIAGO DEL ESTERO|S\.? ?DEL ESTERO|\bSDE\b|\bSGO\b|\b922\b'),
+         ('TIERRA DEL FUEGO', r'TIERRA DEL FUEGO|\bTDF\b|\b923\b'), ('TUCUMAN', r'TUCUMAN|TUC\b|\b924\b')]
 
 
 def juris(label):
@@ -940,6 +962,7 @@ def suma_componentes(d):
 #  Encabezado sin QR (respaldo por texto)
 # ---------------------------------------------------------------------------
 LETRA = {1: 'A', 2: 'A', 3: 'A', 6: 'B', 7: 'B', 8: 'B', 11: 'C', 12: 'C', 13: 'C', 51: 'M', 52: 'M', 53: 'M', 17: 'A', 18: 'B',
+         81: 'A', 82: 'B', 83: 'B',
          201: 'A', 202: 'A', 203: 'A', 206: 'B', 207: 'B', 208: 'B', 211: 'C', 212: 'C', 213: 'C'}
 
 
@@ -1032,6 +1055,9 @@ def procesar(f, ctx):
     empresas = set(ctx.get('empresas') or [])
     qr, qr_via = leer_qr(doc)
     aviso_qr = corregir_escala_qr(qr, texto)
+    aviso_tipo = corregir_tipo_qr(qr, texto)
+    if aviso_tipo:
+        aviso_qr = (aviso_qr + ' ' if aviso_qr else '') + aviso_tipo
     h = encabezado_texto(texto, empresas) if not qr else {}
     d = datos_base(qr, h)
     if not d['receptor']['cuit']:   # QR sin receptor: se busca un CUIT del grupo en el texto
