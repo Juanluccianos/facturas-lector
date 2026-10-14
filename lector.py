@@ -43,7 +43,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.12'
+VERSION = '1.0.13'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -803,10 +803,12 @@ ESQUEMA_GEMINI = {
         'emisor_cuit': _S('CUIT del emisor, 11 dígitos'), 'emisor_razon_social': _S('Razón social del emisor'),
         'emisor_condicion_iva': _S('Condición IVA del emisor'),
         'receptor_cuit': _S('CUIT del receptor'),
-        'tipo_comprobante_arca': {'type': 'INTEGER', 'nullable': True, 'description': 'Código ARCA: 1 FA, 2 NDA, 3 NCA, 6 FB, 11 FC, 51 FM, 201 FCE A...'},
+        'tipo_comprobante_arca': {'type': 'INTEGER', 'nullable': True, 'description': 'Código ARCA: 1 FA, 2 NDA, 3 NCA, 6 FB, 11 FC, 51 FM, 201 FCE A, 17 Liquidación de Servicios Públicos A, 18 Liquidación de Servicios Públicos B, 81 Tique Factura A...'},
+        'tipo_autorizacion': {'type': 'STRING', 'nullable': True, 'enum': ['CAE', 'CAEA', 'CAI', 'CESP'],
+                              'description': 'Qué código de autorización trae: CAE (lo normal), CAEA, CAI, o CESP (C.E.S.P., facturas de luz/gas/agua)'},
         'punto_venta': {'type': 'INTEGER', 'nullable': True}, 'numero': {'type': 'INTEGER', 'nullable': True},
         'fecha_emision': _S('YYYY-MM-DD'), 'fecha_vencimiento_pago': _S('YYYY-MM-DD (no el vencimiento del CAE)'),
-        'cae': _S('CAE de 14 dígitos'),
+        'cae': _S('Código de autorización de 14 dígitos (CAE, CAEA, CAI o C.E.S.P.)'),
         'neto_gravado': {'type': 'ARRAY', 'description': 'Una entrada por alícuota de IVA discriminada',
                          'items': {'type': 'OBJECT', 'properties': {'alicuota': {'type': 'NUMBER'}, 'neto': {'type': 'NUMBER'}, 'iva': {'type': 'NUMBER'}},
                                    'required': ['alicuota', 'neto', 'iva']}},
@@ -836,7 +838,9 @@ def gemini_leer(pdf_bytes, cuentas, empresas=None):
     listado = '\n'.join(f"{c['codigo_concepto']} — {c['denominacion']}" for c in cuentas[:400])
     prompt = ('Sos un analista contable argentino. Extraé los datos de este comprobante de proveedor recibido por Lucciano\'s. '
               'Importes como número con punto decimal. No inventes: si algo no figura, null. Leé una sola copia si hay original/duplicado. '
-              'Neto + IVA + no gravado + exento + otros tributos + percepciones debe dar el total.'
+              'Neto + IVA + no gravado + exento + otros tributos + percepciones debe dar el total. '
+              'Las facturas de luz, gas o agua suelen ser "Liquidación de Servicios Públicos" (tipo 17 si es A, 18 si es B) '
+              'y traen C.E.S.P. en lugar de CAE: en ese caso tipo_autorizacion = CESP.'
               + (('\nEl receptor (cliente) es una de estas sociedades del grupo, buscá su CUIT en el bloque del cliente: '
                   + ', '.join(sorted(empresas)) + '.') if empresas else '')
               + (f'\n\nPlan de cuentas para sugerir imputación:\n{listado}' if listado else ''))
@@ -964,8 +968,16 @@ def gemini_a_datos(g, d):
     c['numero'] = c.get('numero') or g.get('numero')
     c['fecha_emision'] = c.get('fecha_emision') or fecha_iso(g.get('fecha_emision'))
     c['cae'] = c.get('cae') or (re.sub(r'\D', '', g.get('cae') or '') or None)
+    ta = str(g.get('tipo_autorizacion') or '').upper()
+    if ta in ('CAEA', 'CAI', 'CESP') and c.get('tipo_autorizacion', 'CAE') == 'CAE':
+        c['tipo_autorizacion'] = ta
+    # Servicios públicos (C.E.S.P.): son tipo 17/18 aunque Gemini diga "Factura A"
+    if c.get('tipo_autorizacion') == 'CESP' and c.get('tipo_arca') in (1, 6, None):
+        c['tipo_arca'] = 18 if c.get('tipo_arca') == 6 else 17
+        c['letra'] = LETRA.get(c['tipo_arca'])
     if not d['importes']['total']:
         d['importes']['total'] = num(g.get('total'))
+    c['letra'] = c.get('letra') or LETRA.get(c.get('tipo_arca'))
     return d
 
 
