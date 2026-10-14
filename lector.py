@@ -43,7 +43,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.14'
+VERSION = '1.0.15'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -861,6 +861,8 @@ def gemini_leer(pdf_bytes, cuentas, empresas=None):
     prompt = ('Sos un analista contable argentino. Extraé los datos de este comprobante de proveedor recibido por Lucciano\'s. '
               'Importes como número con punto decimal. No inventes: si algo no figura, null. Leé una sola copia si hay original/duplicado. '
               'Neto + IVA + no gravado + exento + otros tributos + percepciones debe dar el total. '
+              'Si el comprobante está en moneda extranjera (p. ej. "valores expresados en dólares"), todos los importes van '
+              'en ESA moneda, sin convertir a pesos. '
               'Las facturas de luz, gas o agua suelen ser "Liquidación de Servicios Públicos" (tipo 17 si es A, 18 si es B) '
               'y traen C.E.S.P. en lugar de CAE: en ese caso tipo_autorizacion = CESP.'
               + (('\nEl receptor (cliente) es una de estas sociedades del grupo, buscá su CUIT en el bloque del cliente: '
@@ -1001,6 +1003,28 @@ def gemini_a_datos(g, d):
         d['importes']['total'] = num(g.get('total'))
     c['letra'] = c.get('letra') or LETRA.get(c.get('tipo_arca'))
     return d
+
+
+def pasar_a_moneda_original(d):
+    """Factura en dólares (DHL): el QR trae el total en USD pero Gemini a veces devuelve los componentes en pesos.
+    Si los componentes suman total × cotización, se dividen por la cotización."""
+    c, im = d['comprobante'], d['importes']
+    ctz = float(c.get('cotizacion') or 0)
+    if (c.get('moneda') or 'PES') == 'PES' or ctz <= 1 or not im.get('total'):
+        return None
+    suma = suma_componentes(d)
+    if abs(suma - im['total'] * ctz) > max(1.0, im['total'] * ctz * 0.001):
+        return None
+    f = lambda v: round((v or 0) / ctz, 2)
+    im['gravado'] = [dict(alicuota=g['alicuota'], neto=f(g['neto']), iva=f(g['iva'])) for g in im['gravado']]
+    for k in ('sin_discriminar', 'no_gravado', 'exento', 'otros_tributos'):
+        im[k] = f(im.get(k))
+    for p_ in d['percepciones']:
+        p_['importe'] = f(p_['importe'])
+    dif = round(im['total'] - suma_componentes(d), 2)
+    if im['gravado'] and abs(dif) <= 0.05:
+        im['gravado'][0]['neto'] = round(im['gravado'][0]['neto'] + dif, 2)   # redondeo de la conversión
+    return f"Los importes venían en pesos y la factura es en {c['moneda']}: se pasaron a {c['moneda']} con la cotización {ctz:g}."
 
 
 def reclasificar_percepcion_iva(d, texto):
@@ -1196,6 +1220,9 @@ def procesar(f, ctx):
                     d['receptor']['cuit'] = cerca[0]
             if not d['receptor'].get('cuit'):
                 problemas.append('No se pudo leer el CUIT del receptor: completalo en la pestaña Datos (sin él ARCA no puede constatar).')
+            aviso_mon = pasar_a_moneda_original(d)
+            if aviso_mon:
+                problemas.append(aviso_mon)
             aviso = corregir_escala_total(d) if not qr else None   # con QR el total es el del QR (ya validado contra el PDF)
             if aviso:
                 problemas.append(aviso)
