@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import itertools
 import json
@@ -43,9 +44,9 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.16'
+VERSION = '1.1.0'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
-TOL = 0.02
+TOL = 0.05   # mismo margen que el Worker (redondeos de centavos entre renglones)
 
 # ---------------------------------------------------------------------------
 #  Comunicación con el Worker
@@ -998,7 +999,20 @@ def gemini_modelos(base, key):
 
 def gemini_a_datos(g, d):
     num = lambda v: round(float(v or 0), 2)
-    d['importes']['gravado'] = [dict(alicuota=float(x['alicuota']), neto=num(x['neto']), iva=num(x['iva']))
+    def alic(x):   # Gemini a veces no informa la alícuota: se deduce de IVA / neto (21, 10,5, 27, 5, 2,5)
+        if x.get('alicuota') not in (None, ''):
+            try:
+                return float(str(x['alicuota']).replace(',', '.').rstrip('%'))
+            except ValueError:
+                pass
+        n, i = num(x.get('neto')), num(x.get('iva'))
+        if n:
+            r = i / n * 100
+            for a in (21.0, 10.5, 27.0, 5.0, 2.5):
+                if abs(r - a) < 0.15:
+                    return a
+        return 21.0
+    d['importes']['gravado'] = [dict(alicuota=alic(x), neto=num(x.get('neto')), iva=num(x.get('iva')))
                                 for x in g.get('neto_gravado') or [] if num(x.get('neto')) or num(x.get('iva'))]
     d['importes']['sin_discriminar'] = num(g.get('importe_sin_discriminar'))
     d['importes']['no_gravado'] = num(g.get('no_gravado'))
@@ -1178,12 +1192,69 @@ def datos_base(qr, h):
     }
 
 
+def _norm(t):
+    import unicodedata
+    return ''.join(c for c in unicodedata.normalize('NFD', str(t or '')) if unicodedata.category(c) != 'Mn').upper()
+
+
+_RE_AUTORIZACION = re.compile(r'\bC\s*\.?\s*A\s*\.?\s*E\s*\.?\s*A?\b|\bC\s*\.?\s*A\s*\.?\s*I\b|C\s*\.?\s*E\s*\.?\s*S\s*\.?\s*P|COMPROBANTE AUTORIZADO')
+_RE_TIQUE = re.compile(r'\bTIQUE\b|TICKET|CONTROLADOR FISCAL')
+_RE_NO_COMPROBANTE = [
+    (r'REMITO', 'remito'), (r'PRESUPUESTO', 'presupuesto'), (r'\bRECIBO\b|\bRC\s*\d', 'recibo'), (r'NOTA DE PEDIDO|ORDEN DE COMPRA', 'nota de pedido / orden de compra'),
+    (r'ORDEN DE PAGO|\bOP\b', 'orden de pago'), (r'ESTADO DE (SALDOS|CUENTA)|RESUMEN DE CUENTA|LISTADO DE DEUDA|MOVIMIENTOS', 'estado de cuenta / resumen'),
+    (r'CERTIFICAD|CONSTANCIA|\bCBU\b|DATOS BANCARIOS', 'certificado / constancia / datos bancarios'), (r'LEGAJO', 'legajo'),
+    (r'CIRCULAR|BROCHURE|TARIFARIO|INFOGRAFIA|PROMOCION', 'circular / publicidad'), (r'COTIZACION', 'cotización'), (r'ANTICIPO', 'anticipo'),
+    (r'INFORME', 'informe'),
+]
+
+
+def detectar_no_comprobante(texto, nombre, doc):
+    """Archivos que seguro no son facturas, sin gastar IA: sin CAE/CAI/C.E.S.P. ni QR y con nombre o encabezado de remito,
+    presupuesto, recibo, estado de cuenta, etc.; o una imagen chica sin texto (logo / firma del mail). Devuelve el motivo o None."""
+    t = _norm(texto)
+    if _RE_AUTORIZACION.search(t) or _RE_TIQUE.search(t):
+        return None
+    cabeza = _norm(nombre) + ' ' + t[:600]
+    for rx, motivo in _RE_NO_COMPROBANTE:
+        if re.search(rx, cabeza):
+            return motivo.capitalize() + ' (no tiene CAE ni QR)'
+    if len(t.strip()) < 40 and doc.page_count == 1:
+        r = doc[0].rect
+        if r.width * r.height < 420 * 420:
+            return 'Imagen chica sin texto (logo o firma del mail)'
+    return None
+
+
+def resultado_no_comprobante(motivo, texto=''):
+    d = datos_base(None, {})
+    d['es_comprobante_fiscal'] = False
+    d['no_factura_motivo'] = motivo
+    d['lectura'] = {'metodo': 'no_factura', 'qr': None, 'modelo': None, 'plantilla_id': None, 'plantilla_version': None, 'lector_version': VERSION}
+    return {'datos': d, 'qr': None, 'metodo': 'no_factura', 'problemas': [], 'candidatos': [], 'fechas': [], 'texto': (texto or '')[:20000]}
+
+
 def procesar(f, ctx):
     pdf = _req('GET', f"/api/lector/pdf/{f['id']}", raw=True, timeout=120)
-    doc = pymupdf.open(stream=pdf, filetype='pdf')
+    huella = hashlib.sha256(pdf or b'').hexdigest()
+    if not pdf:
+        r = resultado_no_comprobante('Archivo vacío (0 bytes): no se pudo abrir')
+        r['hash'] = huella
+        return r
+    try:
+        doc = pymupdf.open(stream=pdf, filetype='pdf')
+    except Exception as e:
+        r = resultado_no_comprobante(f'El archivo no es un PDF válido ({type(e).__name__})')
+        r['hash'] = huella
+        return r
     texto = texto_pdf(doc)
     empresas = set(ctx.get('empresas') or [])
     qr, qr_via = leer_qr(doc)
+    if not qr and not f.get('forzar_ia'):
+        motivo = detectar_no_comprobante(texto, f.get('archivo_nombre'), doc)
+        if motivo:
+            r = resultado_no_comprobante(motivo, texto)
+            r['hash'] = huella
+            return r
     aviso_qr = corregir_escala_qr(qr, texto)
     aviso_tipo = corregir_tipo_qr(qr, texto)
     if aviso_tipo:
@@ -1289,7 +1360,10 @@ def procesar(f, ctx):
         problemas.append('El PDF no tiene texto (¿escaneado?).')
     d['lectura'] = {'metodo': metodo, 'qr': qr_via, 'modelo': modelo, 'plantilla_id': pl['id'] if pl else None,
                     'plantilla_version': pl.get('version') if pl else None, 'lector_version': VERSION}
+    if d.get('es_comprobante_fiscal') is False and not d.get('no_factura_motivo'):
+        d['no_factura_motivo'] = 'La IA indicó que no es una factura, nota de crédito ni nota de débito'
     return {
+        'hash': huella,
         'datos': d, 'qr': qr, 'metodo': metodo, 'problemas': problemas,
         'candidatos': [{k: c[k] for k in ('cls', 'val', 'rate', 'label', 'clave', 'modo')} for c in _dedup(cands)][:400],
         'fechas': fechas_etiquetadas(texto)[:80],
