@@ -43,7 +43,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.0.15'
+VERSION = '1.0.16'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.02
 
@@ -852,6 +852,27 @@ ESQUEMA_GEMINI = {
 }
 
 
+class SinCupoGemini(RuntimeError):
+    """Gemini respondió 429 en todos los modelos: es falta de cupo, no un problema de la factura."""
+
+
+ESTADO_GEMINI = {'sin_cupo': False, 'ultima': 0.0}
+GEMINI_PAUSA = float(os.environ.get('GEMINI_PAUSA', '6'))   # segundos mínimos entre lecturas (cupo por minuto del plan)
+
+
+def _espera_429(e):
+    """Lee el retryDelay que manda Gemini en el 429 (ej. "27s"); None si no viene."""
+    try:
+        cuerpo = json.loads(e.read().decode('utf-8', 'replace'))
+        for det in cuerpo.get('error', {}).get('details', []):
+            rd = det.get('retryDelay')
+            if rd:
+                return float(str(rd).rstrip('s'))
+    except Exception:
+        pass
+    return None
+
+
 def gemini_leer(pdf_bytes, cuentas, empresas=None):
     key = os.environ.get('GEMINI_API_KEY')
     if not key:
@@ -880,6 +901,11 @@ def gemini_leer(pdf_bytes, cuentas, empresas=None):
 
     # Primero el modelo fijado en GEMINI_MODEL (si hay); si da 404 (no disponible) o 429 (sin cupo en el
     # plan gratuito), se prueban los demás modelos que tiene habilitados la clave, del más conveniente al menos.
+    if ESTADO_GEMINI['sin_cupo']:
+        raise SinCupoGemini('SIN_CUPO_GEMINI: Gemini sin cupo en esta corrida; se reintenta sola más tarde.')
+    espera = GEMINI_PAUSA - (time.time() - ESTADO_GEMINI['ultima'])
+    if espera > 0:
+        time.sleep(espera)
     probar = ([model] if model else []) + [m for m in gemini_modelos(base, key) if m != model]
     errores = []
     for m in probar[:5]:
@@ -887,8 +913,14 @@ def gemini_leer(pdf_bytes, cuentas, empresas=None):
         for intento in range(3):
             try:
                 data = llamar(m)
+                ESTADO_GEMINI['ultima'] = time.time()
                 break
             except urllib.error.HTTPError as e:
+                if e.code == 429 and intento == 0:   # cupo por minuto: si Gemini dice que es una espera corta, se espera y se reintenta
+                    rd = _espera_429(e)
+                    if rd is not None and rd <= 65:
+                        time.sleep(rd + 2)
+                        continue
                 if e.code in (500, 502, 503, 504) and intento < 2:   # Gemini saturado: se espera y se reintenta
                     time.sleep(10 * (intento + 1))
                     continue
@@ -902,6 +934,10 @@ def gemini_leer(pdf_bytes, cuentas, empresas=None):
             print(f'  Gemini: usé {m} (antes fallaron: {", ".join(errores)}). Conviene fijar GEMINI_MODEL={m} en GitHub.')
         txt = ''.join(p.get('text', '') for p in data.get('candidates', [{}])[0].get('content', {}).get('parts', []))
         return json.loads(txt), m
+    ESTADO_GEMINI['ultima'] = time.time()
+    if errores and any(x.endswith('HTTP 429') for x in errores) and all(x.endswith(('HTTP 429', 'HTTP 404')) for x in errores):
+        ESTADO_GEMINI['sin_cupo'] = True
+        raise SinCupoGemini('SIN_CUPO_GEMINI: ' + '; '.join(errores))
     raise RuntimeError('Ningún modelo de Gemini respondió: ' + '; '.join(errores or ['la clave no tiene modelos habilitados']))
 
 
@@ -1264,6 +1300,9 @@ def procesar(f, ctx):
 def main():
     ctx = _req('GET', '/api/lector/trabajo')
     facturas = ctx.get('facturas') or []
+    if ctx.get('gemini_pausado'):   # el Worker sabe que Gemini está sin cupo: se leen solo las que no necesitan IA
+        ESTADO_GEMINI['sin_cupo'] = True
+        print(f"Gemini en pausa por falta de cupo hasta {ctx.get('gemini_pausado')}: solo se leen las que no necesitan IA.")
     print(f'Lector {VERSION}: {len(facturas)} factura(s) para leer')
     for f in facturas:
         try:
