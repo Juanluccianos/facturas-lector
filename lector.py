@@ -44,7 +44,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.05   # mismo margen que el Worker (redondeos de centavos entre renglones)
 
@@ -163,6 +163,28 @@ def _dig(v):
     return re.sub(r'\D', '', t)
 
 
+def _num(v):
+    """Número de un campo del QR o None si viene vacío o no es un número (p. ej. Tefasa: "importe":, "ctz":,)."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    t = str(v).strip().replace(' ', '')
+    if not t:
+        return None
+    if re.match(r'^-?\d+,\d+$', t):
+        t = t.replace(',', '.')
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def _int(v):
+    n = _num(v)
+    return int(n) if n is not None else None
+
+
 def _json_tolerante(raw):
     """QR con JSON inválido (Datcom: "fecha":0026-10-06 sin comillas, "ptoVta":00003 con ceros adelante).
     Se leen los pares "clave":valor uno por uno."""
@@ -216,12 +238,13 @@ def _decodificar_qr(texto):
     return {
         'fecha': fecha_iso(q.get('fecha')),
         'cuit_emisor': _dig(q.get('cuit')),
-        'pto_vta': int(q['ptoVta']) if q.get('ptoVta') is not None else None,
-        'tipo': int(q['tipoCmp']) if q.get('tipoCmp') is not None else None,
-        'numero': int(q['nroCmp']) if q.get('nroCmp') is not None else None,
-        'total': round(float(q.get('importe', 0)), 2),
+        'pto_vta': _int(q.get('ptoVta')),
+        'tipo': _int(q.get('tipoCmp')),
+        'numero': _int(q.get('nroCmp')),
+        # Importe vacío en el QR → None (el total se lee del PDF); antes rompía con float(None)
+        'total': round(_num(q.get('importe')), 2) if _num(q.get('importe')) is not None else None,
         'moneda': q.get('moneda') or 'PES',
-        'cotizacion': float(q.get('ctz') or 1),
+        'cotizacion': _num(q.get('ctz')) or 1,
         'doc_receptor': _dig(q.get('nroDocRec')),
         'tipo_autorizacion': 'CAEA' if q.get('tipoCodAut') == 'A' else 'CAE',
         'cae': _dig(q.get('codAut')),
@@ -326,9 +349,10 @@ def _leer_qr(doc):
                     _ext(r.text)
             except Exception:
                 continue
-    # 3) página renderizada (QR dibujado con vectores)
+    # 3) página renderizada (QR dibujado con vectores). Con zoom alto se lee aunque lo cruce una línea
+    #    (p. ej. la línea de firma de "Impreso por…"): con 2 y 3 no alcanzaba.
     for page in list(doc)[:2]:
-        for zoom in (2, 3):
+        for zoom in (2, 3, 4, 6):
             img = Image.open(io.BytesIO(page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom)).tobytes('png')))
             for r in zxingcpp.read_barcodes(img):
                 q = _decodificar_qr(r.text)
@@ -1249,6 +1273,7 @@ def procesar(f, ctx):
     texto = texto_pdf(doc)
     empresas = set(ctx.get('empresas') or [])
     qr, qr_via = leer_qr(doc)
+    qr_sin_importe = bool(qr) and not qr.get('total')   # QR sin importe (Tefasa): el total lo lee Gemini
     if not qr and not f.get('forzar_ia'):
         motivo = detectar_no_comprobante(texto, f.get('archivo_nombre'), doc)
         if motivo:
@@ -1273,7 +1298,9 @@ def procesar(f, ctx):
 
     faltan = [k for k, v in (('CUIT emisor', cuit), ('tipo', d['comprobante']['tipo_arca']), ('número', d['comprobante']['numero']),
                              ('total', d['importes']['total'])) if not v]
-    if pl and not f.get('forzar_ia') and not sin_texto:
+    if qr_sin_importe:
+        problemas.append('El QR del proveedor no trae el importe: el total y el desglose se leyeron del PDF. Verificalos.')
+    if pl and not f.get('forzar_ia') and not sin_texto and not qr_sin_importe:
         metodo = 'plantilla' if pl['estado'] == 'activa' else 'plantilla_pendiente'
         d, problemas = aplicar_plantilla(pl['config'], cands, texto, d)
         if problemas and abs(suma_componentes(d) - d['importes']['total']) > TOL and not faltan:
@@ -1358,8 +1385,16 @@ def procesar(f, ctx):
         problemas.append('No pude leer del PDF: ' + ', '.join(faltan) + '.')
     if sin_texto and metodo != 'ia':
         problemas.append('El PDF no tiene texto (¿escaneado?).')
+    # CUIT impresos en el PDF (sin las empresas del grupo): el Worker los compara con el CUIT del QR. Si el del QR no
+    # figura impreso, la factura va a revisión aunque ARCA la apruebe (p. ej. encabezado "Template" con otro CUIT).
+    cuits_impresos = []
+    for m in re.finditer(r'(?<!\d)(\d{2})[\s\-.]?(\d{8})[\s\-.]?(\d)(?!\d)', texto):
+        c = ''.join(m.groups())
+        if cuit_valido(c) and c not in empresas and c not in cuits_impresos:
+            cuits_impresos.append(c)
     d['lectura'] = {'metodo': metodo, 'qr': qr_via, 'modelo': modelo, 'plantilla_id': pl['id'] if pl else None,
-                    'plantilla_version': pl.get('version') if pl else None, 'lector_version': VERSION}
+                    'plantilla_version': pl.get('version') if pl else None, 'lector_version': VERSION,
+                    'cuits_impresos': cuits_impresos[:10]}
     if d.get('es_comprobante_fiscal') is False and not d.get('no_factura_motivo'):
         d['no_factura_motivo'] = 'La IA indicó que no es una factura, nota de crédito ni nota de débito'
     return {
