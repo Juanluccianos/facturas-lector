@@ -44,7 +44,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.05   # mismo margen que el Worker (redondeos de centavos entre renglones)
 
@@ -453,6 +453,8 @@ def clasif(label):
         return 'OTROS'
     if re.search(r'^LEY\b|\bLEY (PROV|\d)', L):   # tributos de servicios públicos: "LEY 11769 ART 75", "LEY PROV. 7290"
         return 'OTROS'
+    if re.search(r'^FINANCIAMIENTO\b|^CONTRIBUCION\b|^TASA\b', L):   # 1.3.0: "Financiamiento ERAS / APLA" (AySA), tasas
+        return 'OTROS'
     if re.search(r'\bI\.?V\.?A\.?\b|IVA INSC', L):
         return 'IVA'
     if re.search(r'NETO|SUBTOTAL|SUB TOTAL|GRAVADO|BASE (IMPONIBLE|GRAV)', L):
@@ -465,7 +467,7 @@ def clasif(label):
 
 
 def rate_in(label):
-    for m in re.finditer(r'(\d{1,2}(?:[.,]\d{1,2})?)\s*%', str(label)):
+    for m in re.finditer(r'(\d{1,2}(?:[.,]\d+)?)\s*%', str(label)):   # 1.3.0: "27.000%" (AySA)
         r = float(m.group(1).replace(',', '.'))
         if r in RATES:
             return r
@@ -476,7 +478,19 @@ def candidatos(texto):
     """Lista de {cls, val, rate, label, clave, modo}. modo: linea | columna."""
     lines = [l for l in texto.splitlines() if l.strip()]
     out, prev_segs = [], None
+    en_recargo = False
     for l in lines:
+        ini = len(out)
+        # 1.3.0: bloque de recargo por pago fuera de término (AySA: "Recargo  Porcentaje 3.329% ..." hasta "Total Recargos"):
+        # sus IVA y percepciones no son de la factura
+        Ln = norm(l)
+        if re.match(r'^RECARGO\b', Ln) and '%' in l:
+            en_recargo = True
+        if en_recargo:
+            if re.search(r'TOTAL RECARGOS', Ln):
+                en_recargo = False
+            prev_segs = None
+            continue
         l2 = re.sub(r'\$', ' $ ', l)
         l2 = re.sub(r':(?=\S)', ': ', l2)
         segs = [s.strip() for s in re.split(r'\s{2,}', l2.strip()) if s.strip() and s.strip() != '$']
@@ -522,6 +536,20 @@ def candidatos(texto):
             hubo_num = True
         if pend_val and pend_val['cls'] != 'IVA':   # "PERCEP. IB Tucuman .01 % 3.12"
             out.append(pend_val)
+        # 1.3.0: "0.500%   110.369,54   551,85   Perc. IIBB CABA" — la etiqueta viene después de los números
+        m_fin = re.match(r'^\s*(\d{1,2}(?:[.,]\d+)?)\s*%\s+([\d.,]+)\s+([\d.,]+)\s+([A-Za-zÁÉÍÓÚáéíóúÑñ][^\d]*)$', l)
+        if m_fin and clasif(m_fin.group(4)) and money(m_fin.group(3)) is not None:
+            lab = m_fin.group(4).strip()
+            out.append(dict(cls=clasif(lab), val=money(m_fin.group(3)), rate=rate_in(m_fin.group(1) + '%'), label=lab, clave=clave_etiqueta(lab), modo='linea'))
+        # 1.3.0: "IVA Base   27.000%   110.369,54   29.799,78" / "Perc. IVA 3.000%  110.369,54  3.311,09": base imponible e
+        # impuesto en el mismo renglón. Si un importe es otro × alícuota, el más grande era la base: se descarta.
+        tasas = [float(x.replace(',', '.')) for x in re.findall(r'(\d{1,2}(?:[.,]\d+)?)\s*%', l)]
+        nuevos = out[ini:]
+        if tasas and len(nuevos) >= 2:
+            bases = [c for c in nuevos if c['cls'] != 'TOTAL' and any(
+                abs(c['val'] * r / 100 - o['val']) <= max(0.05, o['val'] * 0.002)
+                for o in nuevos if o is not c and o['cls'] == c['cls'] for r in tasas if r > 0)]
+            out[ini:] = [c for c in nuevos if c not in bases]
         prev_segs = segs
     return out
 
@@ -1184,6 +1212,22 @@ def encabezado_texto(texto, empresas):
     if not lsp:
         m = re.search(r'C[OÓ]D(?:IGO)?\.?\s*N?[°º]?\s*:?\s*0*(\d{1,3})\b', texto, re.I)
         h['tipo'] = int(m.group(1)) if m and int(m.group(1)) in LETRA else None
+    # 1.3.0: AySA y similares: "LIQUIDACIÓN DE SERVICIOS PÚBLICOS A17 Nº 0106A12378943" (letra + código pegados; número con la letra en el medio)
+    m = re.search(RX_LSP + r'\s*([AB])\s*(17|18)?\s*N?[°º]?\s*(\d{4,5})\s*[AB]?\s*(\d{8})(?!\d)', T)
+    if m:
+        h['tipo'] = 17 if m.group(1) == 'A' else 18
+        h['pto_vta'], h['numero'] = int(m.group(3)), int(m.group(4))
+    # 1.3.0: letra sola en un renglón y el código abajo ("A" / "001  Fecha: ...") o letra sola cerca de "FACTURA"
+    if not h.get('tipo'):
+        cab = '\n'.join(texto.splitlines()[:25])
+        m = re.search(r'(?m)^\s*([ABCM])(?:\s+FACTURA\b[^\n]*)?\s*$\n\s*0*(\d{1,3})\b', _norm(cab))   # "A   Factura en Cta. Cte." / "001   Fecha: ..." 
+        if m and int(m.group(2)) in LETRA and LETRA[int(m.group(2))] == m.group(1):
+            h['tipo'] = int(m.group(2))
+        else:
+            m = re.search(r'(?m)^\s*([ABCM])\s*$', cab)
+            C = _norm(cab)
+            if m and re.search(r'\bFACTURA\b', C) and not re.search(r'NOTA DE (CREDITO|DEBITO)', C):
+                h['tipo'] = {'A': 1, 'B': 6, 'C': 11, 'M': 51}[m.group(1)]
     m = re.search(r'Fecha(?:\s+de)?(?:\s+Emisi[oó]n)?\s*:?\s*(\d{1,2}\s*[/.\-]\s*\d{1,2}\s*[/.\-]\s*\d{2,4})', texto, re.I) \
         or re.search(r'Emisi[oó]n\s*:?\s*(\d{1,2}\s*/\s*\d{1,2}\s*/\s*\d{4})', texto, re.I)
     h['fecha'] = fecha_iso(m.group(1)) if m else None
@@ -1192,7 +1236,42 @@ def encabezado_texto(texto, empresas):
         h['fecha'] = fecha_iso(m.group(1)) if m else None
     tot = [c['val'] for c in candidatos(texto) if c['cls'] == 'TOTAL']
     h['total'] = max(tot) if tot else None
+    if not h['total']:   # 1.3.0: "Son Pesos: Veinte mil trescientos treinta y nueve con 60/100"
+        h['total'] = total_en_letras(texto)
     return h
+
+
+_UNID = {'CERO': 0, 'UN': 1, 'UNO': 1, 'UNA': 1, 'DOS': 2, 'TRES': 3, 'CUATRO': 4, 'CINCO': 5, 'SEIS': 6, 'SIETE': 7, 'OCHO': 8, 'NUEVE': 9,
+         'DIEZ': 10, 'ONCE': 11, 'DOCE': 12, 'TRECE': 13, 'CATORCE': 14, 'QUINCE': 15, 'DIECISEIS': 16, 'DIECISIETE': 17, 'DIECIOCHO': 18,
+         'DIECINUEVE': 19, 'VEINTE': 20, 'VEINTIUN': 21, 'VEINTIUNO': 21, 'VEINTIUNA': 21, 'VEINTIDOS': 22, 'VEINTITRES': 23, 'VEINTICUATRO': 24,
+         'VEINTICINCO': 25, 'VEINTISEIS': 26, 'VEINTISIETE': 27, 'VEINTIOCHO': 28, 'VEINTINUEVE': 29, 'TREINTA': 30, 'CUARENTA': 40,
+         'CINCUENTA': 50, 'SESENTA': 60, 'SETENTA': 70, 'OCHENTA': 80, 'NOVENTA': 90, 'CIEN': 100, 'CIENTO': 100, 'DOSCIENTOS': 200,
+         'DOSCIENTAS': 200, 'TRESCIENTOS': 300, 'TRESCIENTAS': 300, 'CUATROCIENTOS': 400, 'CUATROCIENTAS': 400, 'QUINIENTOS': 500,
+         'QUINIENTAS': 500, 'SEISCIENTOS': 600, 'SEISCIENTAS': 600, 'SETECIENTOS': 700, 'SETECIENTAS': 700, 'OCHOCIENTOS': 800,
+         'OCHOCIENTAS': 800, 'NOVECIENTOS': 900, 'NOVECIENTAS': 900}
+
+
+def total_en_letras(texto):
+    """Importe escrito en letras ("Son pesos ... con 60/100"). Devuelve None si no lo entiende."""
+    T = _norm(texto)
+    m = re.search(r'SON\s*(?:PESOS|\$)?\s*:?\s*([A-Z ]+?)\s*(?:CON\s+(\d{1,2})\s*/\s*100|CON\s+(\d{1,2})\s*(?:CTS|CENTAVOS)|\.|$)', T, re.M)
+    if not m:
+        return None
+    total, parcial = 0, 0
+    for w in m.group(1).split():
+        if w in ('Y', 'PESOS', 'CON'):
+            continue
+        if w in ('MIL',):
+            parcial = (parcial or 1) * 1000; total += parcial; parcial = 0
+        elif w in ('MILLON', 'MILLONES'):
+            parcial = (parcial or 1) * 1_000_000; total += parcial; parcial = 0
+        elif w in _UNID:
+            parcial += _UNID[w]
+        else:
+            return None
+    entero = total + parcial
+    cent = int(m.group(2) or m.group(3) or 0)
+    return round(entero + cent / 100, 2) if entero > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -1224,7 +1303,8 @@ def _norm(t):
 _RE_AUTORIZACION = re.compile(r'\bC\s*\.?\s*A\s*\.?\s*E\s*\.?\s*A?\b|\bC\s*\.?\s*A\s*\.?\s*I\b|C\s*\.?\s*E\s*\.?\s*S\s*\.?\s*P|COMPROBANTE AUTORIZADO')
 _RE_TIQUE = re.compile(r'\bTIQUE\b|TICKET|CONTROLADOR FISCAL')
 _RE_NO_COMPROBANTE = [
-    (r'REMITO', 'remito'), (r'PRESUPUESTO', 'presupuesto'), (r'\bRECIBO\b|\bRC\s*\d', 'recibo'), (r'NOTA DE PEDIDO|ORDEN DE COMPRA', 'nota de pedido / orden de compra'),
+    (r'REMITO', 'remito'), (r'PRESUPUESTO', 'presupuesto'), (r'\bRECIBO\b|\bRC\s*\d|\bR\s+E\s+C\s+I\s+B\s+O\b', 'recibo'),
+    (r'^COBRO\b|\nCOBRO\b|DOCUMENTOS ASOCIADOS|MONTO RECIBIDO|TOTAL RECIBIDO', 'recibo de cobro'), (r'PAGO A\s+CUENTA', 'comprobante de pago'), (r'NOTA DE PEDIDO|ORDEN DE COMPRA', 'nota de pedido / orden de compra'),
     (r'ORDEN DE PAGO|\bOP\b', 'orden de pago'), (r'ESTADO DE (SALDOS|CUENTA)|RESUMEN DE CUENTA|LISTADO DE DEUDA|MOVIMIENTOS', 'estado de cuenta / resumen'),
     (r'CERTIFICAD|CONSTANCIA|\bCBU\b|DATOS BANCARIOS', 'certificado / constancia / datos bancarios'), (r'LEGAJO', 'legajo'),
     (r'CIRCULAR|BROCHURE|TARIFARIO|INFOGRAFIA|PROMOCION', 'circular / publicidad'), (r'COTIZACION', 'cotización'), (r'ANTICIPO', 'anticipo'),
@@ -1291,6 +1371,12 @@ def procesar(f, ctx):
     if not d['emisor']['cuit']:   # el PDF no trae el CUIT del emisor (Edenor) o vino en otro formato
         d['emisor']['cuit'] = emisor_por_texto(texto, ctx.get('plantillas'))
     cands = candidatos(texto)
+    # 1.3.0: factura en $0 (productos sin cargo, Nestlé): no hay nada que pagar ni registrar
+    tots = [c['val'] for c in cands if c['cls'] == 'TOTAL']
+    if not f.get('forzar_ia') and tots and max(tots) == 0 and not d['importes']['total']:
+        r = resultado_no_comprobante('Factura en $0 (sin importe a pagar ni a registrar)', texto)
+        r['hash'] = huella
+        return r
     cuit = d['emisor']['cuit']
     pl = (ctx.get('plantillas') or {}).get(cuit) if cuit else None
     problemas, metodo, modelo = ([aviso_qr] if aviso_qr else []), None, None
