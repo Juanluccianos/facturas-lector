@@ -3,7 +3,7 @@ name: Lector de facturas
 
 on:
   schedule:
-    - cron: '*/15 11-23 * * 1-5'   # UTC → 08:00 a 20:45 hora argentina, lunes a viernes
+    - cron: '0,30 11-23 * * 1-5'   # UTC → cada 30 min, 08:00 a 20:30 hora argentina, lunes a viernes
   workflow_dispatch:
 
 concurrency:
