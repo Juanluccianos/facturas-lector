@@ -25,6 +25,6 @@ jobs:
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           LECTOR_SECRET: ${{ secrets.LECTOR_SECRET }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GEMINI_GATEWAY_URL: ${{ secrets.GEMINI_GATEWAY_URL }}
+          GEMINI_GATEWAY_SECRET: ${{ secrets.GEMINI_GATEWAY_SECRET }}
         run: python lector.py
