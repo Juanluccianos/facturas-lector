@@ -46,7 +46,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.4.0'
+VERSION = '1.4.1'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.05   # mismo margen que el Worker (redondeos de centavos entre renglones)
 
@@ -920,6 +920,18 @@ ESTADO_GEMINI = {'sin_ia': None, 'ultima': 0.0}
 GEMINI_PAUSA = float(os.environ.get('GEMINI_PAUSA', '2'))   # segundos mínimos entre lecturas (el resto lo maneja gemini-luccianos)
 
 
+def quien_leyo(modelo):
+    """Nombre de la IA que leyó la factura, para los avisos (el gateway decide: Claude, Gemini pago o el respaldo)."""
+    m = str(modelo or '').lower()
+    if m.startswith('claude'):
+        return 'Claude'
+    if m.startswith('gemini'):
+        return 'Gemini'
+    if m.startswith('@cf/'):
+        return 'el respaldo gratuito (Cloudflare)'
+    return 'la IA'
+
+
 def gemini_leer(pdf_bytes, cuentas, empresas=None, ref=None):
     """Lee el PDF con Gemini a través del worker gemini-luccianos. Devuelve (datos, modelo) o lanza ErrorIA."""
     if ESTADO_GEMINI['sin_ia']:
@@ -970,7 +982,7 @@ def gemini_leer(pdf_bytes, cuentas, empresas=None, ref=None):
         ESTADO_GEMINI['ultima'] = time.time()
     if res.get('ok'):
         for a in res.get('avisos') or []:
-            print(f'  Gemini: {a}')
+            print(f'  IA: {a}')
         return res['datos'], res.get('modelo')
     err = ErrorIA(res.get('mensaje') or 'No se pudo leer con IA.', res.get('categoria') or 'desconocido', bool(res.get('definitivo')), res.get('reintentar_en_s') or 300)
     if not err.definitivo and err.categoria in SIN_IA_AHORA:
@@ -1353,7 +1365,7 @@ def procesar(f, ctx):
         elif not os.environ.get('GEMINI_GATEWAY_URL'):
             # Sin Gemini configurado: no se traba, va a la bandeja para completarla a mano
             metodo = 'manual'
-            problemas.append('Las reglas generales no alcanzaron para leer esta factura y Gemini no está configurado: '
+            problemas.append('Las reglas generales no alcanzaron para leer esta factura y la lectura con IA no está configurada: '
                              'completá los datos a mano mirando el PDF y confirmá el proveedor.')
             d['comprobante']['fecha_vto_pago'] = buscar_vto(texto)
         else:
@@ -1376,9 +1388,9 @@ def procesar(f, ctx):
             if aviso:
                 problemas.append(aviso)
             if abs(suma_componentes(d) - d['importes']['total']) > TOL:
-                problemas.append(f"La lectura de Gemini no cuadra: componentes {suma_componentes(d):.2f} vs total {d['importes']['total']:.2f}.")
+                problemas.append(f"La lectura hecha por {quien_leyo(modelo)} no cuadra: componentes {suma_componentes(d):.2f} vs total {d['importes']['total']:.2f}.")
             if not qr:
-                problemas.append('Sin QR legible: el encabezado (CUIT, número, CAE) lo leyó Gemini. Verificalo contra el PDF.')
+                problemas.append(f'Sin QR legible: el encabezado (CUIT, número, CAE) lo leyó {quien_leyo(modelo)}. Verificalo contra el PDF.')
     if not qr:
         bar = leer_barras(doc)
         if bar:
@@ -1436,7 +1448,7 @@ def main():
     facturas = ctx.get('facturas') or []
     if ctx.get('gemini_pausado'):   # el Worker sabe que Gemini está sin cupo: se leen solo las que no necesitan IA
         ESTADO_GEMINI['sin_ia'] = ErrorIA(f"Lectura con IA en pausa hasta las {ctx.get('gemini_pausado')}: se reintenta sola.", 'cuota_minuto', False, 600)
-        print(f"Gemini en pausa por falta de cupo hasta {ctx.get('gemini_pausado')}: solo se leen las que no necesitan IA.")
+        print(f"Lectura con IA en pausa hasta {ctx.get('gemini_pausado')}: solo se leen las que no necesitan IA.")
     print(f'Lector {VERSION}: {len(facturas)} factura(s) para leer')
     for f in facturas:
         if time.time() - inicio > TIEMPO_MAX_S:
@@ -1449,7 +1461,9 @@ def main():
         try:
             res = procesar(f, ctx)
             r = _req('POST', f"/api/lector/resultado/{f['id']}", res)
-            print(f"  #{f['id']} {f.get('archivo_nombre') or ''}: {res['metodo']} → {r.get('estado')}"
+            modelo_ia = ((res.get('datos') or {}).get('lectura') or {}).get('modelo')
+            metodo_txt = f"ia ({modelo_ia})" if res['metodo'] == 'ia' and modelo_ia else res['metodo']
+            print(f"  #{f['id']} {f.get('archivo_nombre') or ''}: {metodo_txt} → {r.get('estado')}"
                   + (f" ({'; '.join(res['problemas'])})" if res['problemas'] else ''))
         except ErrorIA as e:
             print(f"  #{f['id']}: lectura con IA no disponible ({e.categoria}): {e.mensaje}")
