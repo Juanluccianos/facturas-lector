@@ -19,8 +19,10 @@
  Variables de entorno (en GitHub: Settings → Secrets and variables → Actions):
    WORKER_URL       https://facturas-api.<subdominio>.workers.dev
    LECTOR_SECRET    mismo valor que LECTOR_SECRET en el Worker
-   GEMINI_API_KEY   key de Google AI Studio (solo se usa con proveedores nuevos)
-   GEMINI_MODEL     opcional; si no está, se elige solo el mejor Flash disponible
+   GEMINI_GATEWAY_URL     URL del worker gemini-luccianos (https://gemini-luccianos.<subdominio>.workers.dev)
+   GEMINI_GATEWAY_SECRET  mismo valor que GEMINI_GATEWAY_SECRET en ese worker
+   (1.4.0: la clave de Gemini ya no va acá: vive en gemini-luccianos como GEMINI_KEY_FACTURAS. Ese worker elige
+   los modelos disponibles, reintenta, maneja la cuota del plan gratuito y registra los errores.)
 =============================================================================
 """
 from __future__ import annotations
@@ -44,7 +46,7 @@ import pymupdf
 import zxingcpp
 from PIL import Image
 
-VERSION = '1.3.0'
+VERSION = '1.4.0'
 RATES = [21.0, 10.5, 27.0, 5.0, 2.5]
 TOL = 0.05   # mismo margen que el Worker (redondeos de centavos entre renglones)
 
@@ -905,34 +907,30 @@ ESQUEMA_GEMINI = {
 }
 
 
-class SinCupoGemini(RuntimeError):
-    """Gemini respondió 429 en todos los modelos: es falta de cupo, no un problema de la factura."""
+class ErrorIA(RuntimeError):
+    """La lectura con IA no se pudo hacer. Trae la categoría del worker gemini-luccianos y si conviene reintentar."""
+    def __init__(self, mensaje, categoria='desconocido', definitivo=False, reintentar_en_s=300):
+        super().__init__(mensaje)
+        self.mensaje, self.categoria, self.definitivo, self.reintentar_en_s = mensaje, categoria, definitivo, reintentar_en_s
 
 
-ESTADO_GEMINI = {'sin_cupo': False, 'ultima': 0.0}
-GEMINI_PAUSA = float(os.environ.get('GEMINI_PAUSA', '6'))   # segundos mínimos entre lecturas (cupo por minuto del plan)
+# Categorías que dicen "ahora no hay IA" (no es culpa de la factura): en esta corrida no se insiste con las demás
+SIN_IA_AHORA = {'cuota_dia', 'cuota_minuto', 'sin_modelos', 'clave_invalida', 'gateway_sin_configurar', 'gateway_secreto', 'gateway_caido', 'sobrecarga'}
+ESTADO_GEMINI = {'sin_ia': None, 'ultima': 0.0}
+GEMINI_PAUSA = float(os.environ.get('GEMINI_PAUSA', '2'))   # segundos mínimos entre lecturas (el resto lo maneja gemini-luccianos)
 
 
-def _espera_429(e):
-    """Lee el retryDelay que manda Gemini en el 429 (ej. "27s"); None si no viene."""
-    try:
-        cuerpo = json.loads(e.read().decode('utf-8', 'replace'))
-        for det in cuerpo.get('error', {}).get('details', []):
-            rd = det.get('retryDelay')
-            if rd:
-                return float(str(rd).rstrip('s'))
-    except Exception:
-        pass
-    return None
-
-
-def gemini_leer(pdf_bytes, cuentas, empresas=None):
-    key = os.environ.get('GEMINI_API_KEY')
-    if not key:
-        raise RuntimeError('Falta GEMINI_API_KEY para leer un proveedor nuevo.')
-    model = (os.environ.get('GEMINI_MODEL') or '').strip()
+def gemini_leer(pdf_bytes, cuentas, empresas=None, ref=None):
+    """Lee el PDF con Gemini a través del worker gemini-luccianos. Devuelve (datos, modelo) o lanza ErrorIA."""
+    if ESTADO_GEMINI['sin_ia']:
+        e = ESTADO_GEMINI['sin_ia']
+        raise ErrorIA(e.mensaje, e.categoria, False, e.reintentar_en_s)
+    url = (os.environ.get('GEMINI_GATEWAY_URL') or '').rstrip('/')
+    if not url:
+        raise ErrorIA('Falta GEMINI_GATEWAY_URL en GitHub (Settings → Secrets and variables → Actions).', 'gateway_sin_configurar', False, 3600)
     listado = '\n'.join(f"{c['codigo_concepto']} — {c['denominacion']}" for c in cuentas[:400])
     prompt = ('Sos un analista contable argentino. Extraé los datos de este comprobante de proveedor recibido por Lucciano\'s. '
+              'PRECISIÓN ANTE TODO: si un dato no se lee con seguridad, null (nunca completes dígitos por deducción). '
               'Importes como número con punto decimal. No inventes: si algo no figura, null. Leé una sola copia si hay original/duplicado. '
               'Neto + IVA + no gravado + exento + otros tributos + percepciones debe dar el total. '
               'Si el comprobante está en moneda extranjera (p. ej. "valores expresados en dólares"), todos los importes van '
@@ -942,111 +940,42 @@ def gemini_leer(pdf_bytes, cuentas, empresas=None):
               + (('\nEl receptor (cliente) es una de estas sociedades del grupo, buscá su CUIT en el bloque del cliente: '
                   + ', '.join(sorted(empresas)) + '.') if empresas else '')
               + (f'\n\nPlan de cuentas para sugerir imputación:\n{listado}' if listado else ''))
-    body = {'contents': [{'role': 'user', 'parts': [{'inline_data': {'mime_type': 'application/pdf', 'data': base64.b64encode(pdf_bytes).decode()}}, {'text': prompt}]}],
-            'generationConfig': {'responseMimeType': 'application/json', 'responseSchema': ESQUEMA_GEMINI, 'temperature': 0}}
-    base = os.environ.get('GEMINI_BASE', 'https://generativelanguage.googleapis.com')
-
-    def llamar(m):
-        req = urllib.request.Request(f'{base}/v1beta/models/{m}:generateContent?key={key}', data=json.dumps(body).encode(),
-                                     headers={'Content-Type': 'application/json'}, method='POST')
-        with urllib.request.urlopen(req, timeout=180) as r:
-            return json.loads(r.read().decode('utf-8'))
-
-    # Primero el modelo fijado en GEMINI_MODEL (si hay); si da 404 (no disponible) o 429 (sin cupo en el
-    # plan gratuito), se prueban los demás modelos que tiene habilitados la clave, del más conveniente al menos.
-    if ESTADO_GEMINI['sin_cupo']:
-        raise SinCupoGemini('SIN_CUPO_GEMINI: Gemini sin cupo en esta corrida; se reintenta sola más tarde.')
     espera = GEMINI_PAUSA - (time.time() - ESTADO_GEMINI['ultima'])
     if espera > 0:
         time.sleep(espera)
-    probar = ([model] if model else []) + [m for m in gemini_modelos(base, key) if m != model]
-    errores = []
-    for m in probar[:5]:
-        data = None
-        for intento in range(3):
-            try:
-                data = llamar(m)
-                ESTADO_GEMINI['ultima'] = time.time()
-                break
-            except urllib.error.HTTPError as e:
-                if e.code == 429 and intento == 0:   # cupo por minuto: si Gemini dice que es una espera corta, se espera y se reintenta
-                    rd = _espera_429(e)
-                    if rd is not None and rd <= 65:
-                        time.sleep(rd + 2)
-                        continue
-                if e.code in (500, 502, 503, 504) and intento < 2:   # Gemini saturado: se espera y se reintenta
-                    time.sleep(10 * (intento + 1))
-                    continue
-                errores.append(f'{m}: HTTP {e.code}')
-                if e.code in (404, 429, 500, 502, 503, 504):        # no disponible / sin cupo / caído: el próximo modelo
-                    break
-                raise RuntimeError(f'Gemini HTTP {e.code} ({m}): {e.read().decode("utf-8", "replace")[:300]}')
-        if data is None:
-            continue
-        if errores:
-            print(f'  Gemini: usé {m} (antes fallaron: {", ".join(errores)}). Conviene fijar GEMINI_MODEL={m} en GitHub.')
-        txt = ''.join(p.get('text', '') for p in data.get('candidates', [{}])[0].get('content', {}).get('parts', []))
-        return json.loads(txt), m
-    ESTADO_GEMINI['ultima'] = time.time()
-    if errores and any(x.endswith('HTTP 429') for x in errores) and all(x.endswith(('HTTP 429', 'HTTP 404')) for x in errores):
-        ESTADO_GEMINI['sin_cupo'] = True
-        raise SinCupoGemini('SIN_CUPO_GEMINI: ' + '; '.join(errores))
-    raise RuntimeError('Ningún modelo de Gemini respondió: ' + '; '.join(errores or ['la clave no tiene modelos habilitados']))
-
-
-_MODELOS = []
-
-
-def gemini_modelos(base, key):
-    """Modelos de la clave, ordenados: Flash estable más nuevo, Pro estable, Flash preview, Pro preview.
-    Flash primero porque el plan gratuito de la API le da cupo; a los Pro muchas veces no."""
-    if _MODELOS:
-        return _MODELOS
-    nombres, token = [], ''
-    for _ in range(10):
-        url = f'{base}/v1beta/models?pageSize=200&key={key}' + (f'&pageToken={token}' if token else '')
-        with urllib.request.urlopen(url, timeout=60) as r:
-            j = json.loads(r.read().decode('utf-8'))
-        for m in j.get('models', []):
-            if 'generateContent' in (m.get('supportedGenerationMethods') or []):
-                nombres.append(m['name'].split('/')[-1])
-        token = j.get('nextPageToken')
-        if not token:
-            break
-
-    def puntaje(n):
-        mm = re.match(r'^gemini-(\d+(?:\.\d+)?)-(pro|flash)(-latest|-preview(?:-\d{2}-\d{4}|-\d{2}-\d{2})?)?$', n)
-        if not mm:
-            return None
-        estable = mm.group(3) in (None, '-latest')
-        es_flash = mm.group(2) == 'flash'
-        return (2 if estable else 0) + (1 if es_flash else 0), float(mm.group(1)), mm.group(3) is None
-
-    puntuados = [(puntaje(n), n) for n in nombres]
-    _MODELOS.extend(n for p, n in sorted([x for x in puntuados if x[0] is not None], reverse=True))
-    return _MODELOS
-    nombres, token = [], ''
-    for _ in range(10):
-        url = f'{base}/v1beta/models?pageSize=200&key={key}' + (f'&pageToken={token}' if token else '')
-        with urllib.request.urlopen(url, timeout=60) as r:
-            j = json.loads(r.read().decode('utf-8'))
-        for m in j.get('models', []):
-            if 'generateContent' in (m.get('supportedGenerationMethods') or []):
-                nombres.append(m['name'].split('/')[-1])
-        token = j.get('nextPageToken')
-        if not token:
-            break
-
-    def puntaje(n):
-        mm = re.match(r'^gemini-(\d+(?:\.\d+)?)-(pro|flash)(.*)$', n)
-        if not mm or n == excluir or re.search(r'lite|image|tts|audio|live|thinking|computer|embedding|exp', mm.group(3)):
-            return None
-        estable = mm.group(3) in ('', '-latest')
-        return (1 if mm.group(2) == 'pro' else 0, 1 if estable else 0, float(mm.group(1)), mm.group(3) == '')
-
-    cands = sorted((p, n) for n in nombres if (p := puntaje(n)) is not None)
-    _MODELO_ELEGIDO['m'] = cands[-1][1] if cands else None
-    return _MODELO_ELEGIDO['m']
+    cuerpo = json.dumps({
+        'app': 'facturas', 'tarea': 'preciso', 'prompt': prompt, 'esquema': ESQUEMA_GEMINI, 'max_tokens': 8192,
+        'archivo': {'mime': 'application/pdf', 'b64': base64.b64encode(pdf_bytes).decode()},
+        'presupuesto_ms': 150000, 'timeout_ms': 120000, 'ref': ref,
+    }).encode('utf-8')
+    req = urllib.request.Request(url + '/leer', data=cuerpo, method='POST', headers={
+        'Content-Type': 'application/json', 'X-Gemini-Secret': os.environ.get('GEMINI_GATEWAY_SECRET', ''),
+        'User-Agent': f'facturas-lector/{VERSION}'})
+    try:
+        with urllib.request.urlopen(req, timeout=200) as r:
+            res = json.loads(r.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        try:
+            res = json.loads(e.read().decode('utf-8', 'replace'))
+        except Exception:
+            res = {}
+        if e.code == 401:
+            res = {'categoria': 'gateway_secreto', 'mensaje': 'El GEMINI_GATEWAY_SECRET de GitHub no coincide con el de gemini-luccianos.', 'reintentar_en_s': 3600}
+        res = {'ok': False, 'categoria': res.get('categoria') or 'gateway_error', 'definitivo': bool(res.get('definitivo')),
+               'reintentar_en_s': res.get('reintentar_en_s') or 300, 'mensaje': res.get('mensaje') or f'El servicio de lectura respondió HTTP {e.code}.'}
+    except Exception as e:
+        res = {'ok': False, 'categoria': 'gateway_caido', 'definitivo': False, 'reintentar_en_s': 120,
+               'mensaje': f'No se pudo contactar al servicio de lectura automática ({type(e).__name__}). Se reintenta solo.'}
+    finally:
+        ESTADO_GEMINI['ultima'] = time.time()
+    if res.get('ok'):
+        for a in res.get('avisos') or []:
+            print(f'  Gemini: {a}')
+        return res['datos'], res.get('modelo')
+    err = ErrorIA(res.get('mensaje') or 'No se pudo leer con IA.', res.get('categoria') or 'desconocido', bool(res.get('definitivo')), res.get('reintentar_en_s') or 300)
+    if not err.definitivo and err.categoria in SIN_IA_AHORA:
+        ESTADO_GEMINI['sin_ia'] = err
+    raise err
 
 
 def gemini_a_datos(g, d):
@@ -1421,7 +1350,7 @@ def procesar(f, ctx):
                 if any(g.get('iva_calculado') for g in sols[0]['gravado']):
                     problemas.append('El IVA no se pudo leer del PDF: se calculó (neto × alícuota) y cierra con el total del QR. Revisalo.')
             d['comprobante']['fecha_vto_pago'] = buscar_vto(texto)
-        elif not os.environ.get('GEMINI_API_KEY'):
+        elif not os.environ.get('GEMINI_GATEWAY_URL'):
             # Sin Gemini configurado: no se traba, va a la bandeja para completarla a mano
             metodo = 'manual'
             problemas.append('Las reglas generales no alcanzaron para leer esta factura y Gemini no está configurado: '
@@ -1429,7 +1358,7 @@ def procesar(f, ctx):
             d['comprobante']['fecha_vto_pago'] = buscar_vto(texto)
         else:
             metodo = 'ia'
-            g, modelo = gemini_leer(pdf, ctx.get('cuentas') or [], empresas)
+            g, modelo = gemini_leer(pdf, ctx.get('cuentas') or [], empresas, ref=f"factura #{f['id']} {f.get('archivo_nombre') or ''}".strip())
             d = gemini_a_datos(g, d)
             rc = d['receptor'].get('cuit')
             if rc and (not cuit_valido(rc) or (empresas and rc not in empresas)):
@@ -1492,19 +1421,42 @@ def procesar(f, ctx):
     }
 
 
+TIEMPO_MAX_S = float(os.environ.get('LECTOR_TIEMPO_MAX', '660'))   # el job de GitHub corta a los 15 min: se deja margen
+
+
+def informar_error(f, err):
+    """Le avisa al Worker que no se pudo leer, con la categoría: si no es culpa de la factura, el Worker no cuenta el intento."""
+    _req('POST', f"/api/lector/resultado/{f['id']}", {
+        'error': err.mensaje, 'categoria': err.categoria, 'definitivo': err.definitivo, 'reintentar_en_s': err.reintentar_en_s})
+
+
 def main():
+    inicio = time.time()
     ctx = _req('GET', '/api/lector/trabajo')
     facturas = ctx.get('facturas') or []
     if ctx.get('gemini_pausado'):   # el Worker sabe que Gemini está sin cupo: se leen solo las que no necesitan IA
-        ESTADO_GEMINI['sin_cupo'] = True
+        ESTADO_GEMINI['sin_ia'] = ErrorIA(f"Lectura con IA en pausa hasta las {ctx.get('gemini_pausado')}: se reintenta sola.", 'cuota_minuto', False, 600)
         print(f"Gemini en pausa por falta de cupo hasta {ctx.get('gemini_pausado')}: solo se leen las que no necesitan IA.")
     print(f'Lector {VERSION}: {len(facturas)} factura(s) para leer')
     for f in facturas:
+        if time.time() - inicio > TIEMPO_MAX_S:
+            # Sin tiempo para seguir: vuelven a la fila sin contar el intento (antes quedaban "leyendo" 20 minutos)
+            try:
+                informar_error(f, ErrorIA('El lector se quedó sin tiempo en esta corrida: la factura se lee en la próxima.', 'sin_tiempo', False, 60))
+            except Exception as e2:
+                print(f'  #{f["id"]}: no pude devolverla a la fila: {e2}', file=sys.stderr)
+            continue
         try:
             res = procesar(f, ctx)
             r = _req('POST', f"/api/lector/resultado/{f['id']}", res)
             print(f"  #{f['id']} {f.get('archivo_nombre') or ''}: {res['metodo']} → {r.get('estado')}"
                   + (f" ({'; '.join(res['problemas'])})" if res['problemas'] else ''))
+        except ErrorIA as e:
+            print(f"  #{f['id']}: lectura con IA no disponible ({e.categoria}): {e.mensaje}")
+            try:
+                informar_error(f, e)
+            except Exception as e2:
+                print(f'  #{f["id"]}: no pude informar el error al Worker: {e2}', file=sys.stderr)
         except Exception as e:
             traceback.print_exc()
             try:
